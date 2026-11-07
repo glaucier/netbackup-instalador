@@ -1,4 +1,4 @@
-"""Testes do instalar.sh (Fase 3a).
+"""Testes do instalar.sh (Fases 3a e 3b).
 
 Rodam como usuário comum: raiz falsa (caminhos por variável de ambiente) e
 comandos falsos no PATH. Nada toca disco, /etc, /root ou /opt reais.
@@ -28,9 +28,86 @@ FAKES = {
     "id": 'echo "${FAKE_UID:-0}"',
     "hostname": "echo vm-teste",
     "dpkg": 'echo "${FAKE_ARCH:-amd64}"',
-    "ufw": '[ -e "$FAKE_STATE/ufw_inactive" ] && echo "Status: inactive" || echo "Status: active"',
-    "timedatectl": '[ -e "$FAKE_STATE/ntp_no" ] && echo no || echo yes',
-    "systemctl": "exit 0",
+    "ufw": r'''
+case "$1" in
+  status)
+    if [ -e "$FAKE_STATE/ufw_inactive" ]; then echo "Status: inactive"; else echo "Status: active"; fi
+    cat "$FAKE_STATE/ufw_rules" 2>/dev/null; exit 0 ;;
+  allow)
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in from) f="$2" ;; port) p="$2" ;; comment) c="$2" ;; esac
+      shift
+    done
+    if [ -e "$FAKE_STATE/ufw_allow_fail" ]; then echo "ERROR" >&2; exit 1; fi
+    echo "$p/tcp                     ALLOW       ${f%/32}              # $c" >> "$FAKE_STATE/ufw_rules"
+    echo "Rule added"; exit 0 ;;
+esac
+exit 0''',
+    "timedatectl": r'''
+case "$*" in
+  *Timezone*) cat "$FAKE_STATE/timezone" 2>/dev/null || echo America/Sao_Paulo ;;
+  *) [ -e "$FAKE_STATE/ntp_no" ] && echo no || echo yes ;;
+esac''',
+    "systemctl": r'''
+case "$1" in
+  is-active)
+    for a; do u="$a"; done; u="${u%.service}"
+    [ -e "$FAKE_STATE/inactive_$u" ] && exit 3
+    exit 0 ;;
+  is-enabled) [ -e "$FAKE_STATE/unit_off" ] && exit 1; exit 0 ;;
+esac
+exit 0''',
+    "ip": r'''
+if [ -e "$FAKE_STATE/ip_addr" ]; then cat "$FAKE_STATE/ip_addr"; exit 0; fi
+echo "2: eth0    inet 203.0.113.10/24 brd 203.0.113.255 scope global eth0\\       valid_lft forever"
+echo "2: eth0    inet6 2001:db8::10/64 scope global \\       valid_lft forever"''',
+    "dig": r'''
+for a; do
+  case "$a" in @*) r="${a#@}" ;; A|AAAA) t="$a" ;; esac
+done
+for f in "$FAKE_STATE/dig_${r}_$t" "$FAKE_STATE/dig_$t"; do
+  if [ -e "$f" ]; then cat "$f"; exit 0; fi
+done
+exit 0''',
+    "who": '[ -e "$FAKE_STATE/who_m" ] && cat "$FAKE_STATE/who_m"; exit 0',
+    "ss": 'cat "$FAKE_STATE/ss_listen" 2>/dev/null; exit 0',
+    "curl": 'echo "$(cat "$FAKE_STATE/curl_code" 2>/dev/null || echo 302)"',
+    "openssl": r'''
+case "$1" in
+  rand) echo feedfacecafebeeffeedfacecafebeeffeedfacecafebeeffeedfacecafebeef ;;
+  req)
+    while [ $# -gt 0 ]; do
+      case "$1" in -keyout) k="$2" ;; -out) o="$2" ;; -addext) echo "SAN $2" >> "$FAKE_CALLS" ;; esac
+      shift
+    done
+    [ -e "$FAKE_STATE/openssl_req_fail" ] && exit 1
+    echo FAKE-PROV-KEY > "$k"; echo FAKE-PROV-CERT > "$o" ;;
+  x509) exit "$(cat "$FAKE_STATE/x509_rc" 2>/dev/null || echo 0)" ;;
+esac
+exit 0''',
+    "certbot": r'''
+while [ $# -gt 0 ]; do case "$1" in -d) d="$2" ;; esac; shift; done
+[ -e "$FAKE_STATE/certbot_fail" ] && { echo "certbot: falhou (teste)" >&2; exit 1; }
+mkdir -p "$LE_LIVE/$d" && echo CERT > "$LE_LIVE/$d/fullchain.pem" && echo KEY > "$LE_LIVE/$d/privkey.pem"
+exit 0''',
+    "nginx": r'''
+if [ "$1" = "-t" ]; then
+  [ -e "$FAKE_STATE/nginx_t_fail" ] && { echo "nginx: [emerg] teste" >&2; exit 1; }
+  if [ -e "$FAKE_STATE/nginx_t_fail_definitivo" ] && [ -f "$NGINX_SITE_DST" ] && [ "$(head -n 1 "$NGINX_SITE_DST")" != "# PROVISORIO - gerado por instalar.sh (não editar)" ]; then
+    echo "nginx: [emerg] teste definitivo" >&2; exit 1
+  fi
+fi
+exit 0''',
+    "stat": r'''
+# Simula a árvore do produto passando para o usuário netbackup depois do deploy.
+if [ -e "$FAKE_STATE/nb_owner_netbackup" ]; then
+  fmt="$2"; for p; do :; done
+  case "$p" in "$NB_DIR"|"$NB_DIR"/*)
+    case "$fmt" in %u) echo 4242; exit 0 ;; %U) echo netbackup; exit 0 ;; esac ;;
+  esac
+fi
+exec /usr/bin/stat "$@"''',
     "lsblk": r'''
 case "$1" in
   -dnpo) cat "$FAKE_STATE/disks" 2>/dev/null ;;
@@ -98,14 +175,88 @@ case "$1" in
   clone)
     shift; [ "$1" = "--branch" ] && shift 2
     repo="$1"; dest="$2"
-    mkdir -p "$dest/.git" "$dest/deploy"
+    mkdir -p "$dest/.git"
+    cp -a "$FAKE_FIXTURE/." "$dest/"
     echo "$repo" > "$dest/.git/fake_remote"
-    printf '#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\nif [ -e "$FAKE_STATE/deploy_mode" ]; then cat "$FAKE_STATE/deploy_mode"; exit "$(cat "$FAKE_STATE/deploy_rc" 2>/dev/null || echo 1)"; fi\necho "[falta] dominio"\necho "[falta] certificado"\nexit 3\n' > "$dest/deploy/deploy.sh"
-    chmod 644 "$dest/deploy/deploy.sh"
     exit 0 ;;
 esac
 exit 0''',
 }
+
+
+# --------------------------------------------------------------------------
+# "Produto" falso (fixture): só a estrutura que o instalador usa. Texto próprio,
+# com exemplos RFC 5737/3849 e example.com; nada do produto real.
+# --------------------------------------------------------------------------
+SECRET_KEY = "feedfacecafebeeffeedfacecafebeeffeedfacecafebeeffeedfacecafebeef"
+APP_SETTINGS_EXAMPLE = """# Configurações gerais (modelo de teste)
+APP_NAME=NetBackup Manager
+APP_HOST=127.0.0.1
+APP_PORT=44319
+APP_SECRET_KEY=ALTERE_AQUI_gerar_com_openssl_rand_hex_32
+TIMEZONE=America/Sao_Paulo
+# DEFAULT_PORT_SSH=22
+# DEFAULT_PORT_HTTPS=443
+# DEFAULT_PORT_HTTP=80
+# DEFAULT_PORT_WINBOX=8291
+# PANEL_HOSTNAME=
+"""
+PANEL_EXAMPLE = """# Redes do painel - modelo.
+# Formato: CIDR e descrição. Exemplos:
+# 203.0.113.10/32  Fulano (administração)
+"""
+PUBLIC_EXAMPLE = """# Redes públicas confiáveis - modelo.
+# 203.0.113.0/24
+"""
+PRIVATE_EXAMPLE = """# Redes privadas confiáveis - modelo.
+# 10.0.0.0/24
+127.0.0.1/32  túnel SSH local
+"""
+NGINX_TEMPLATE = """# NetBackup Manager - modelo de teste (@SERVER_NAME@ = nome do painel)
+server {
+    listen 44318 ssl default_server;
+    listen [::]:44318 ssl default_server;
+    server_name @SERVER_NAME@;
+
+    ssl_certificate     /etc/letsencrypt/live/@SERVER_NAME@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@SERVER_NAME@/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:44319;
+    }
+}
+"""
+DEPLOY_SH = r"""#!/bin/sh
+echo "deploy-run $*" >> "$FAKE_CALLS"
+case "$1" in
+  --check)
+    echo deploy-check-ran >> "$FAKE_CALLS"
+    if [ -e "$FAKE_STATE/deploy_mode" ]; then cat "$FAKE_STATE/deploy_mode"; exit "$(cat "$FAKE_STATE/deploy_rc" 2>/dev/null || echo 1)"; fi
+    echo "[falta] dominio"
+    echo "[falta] certificado"
+    exit 3 ;;
+  --dominio)
+    echo "deploy-dominio $2" >> "$FAKE_CALLS"
+    if [ -e "$FAKE_STATE/deploy_fail" ]; then
+      touch "$FAKE_STATE/nb_owner_netbackup" "$FAKE_STATE/unit_off"
+      echo "ERRO: falha simulada do deploy"; exit "$(cat "$FAKE_STATE/deploy_fail_rc" 2>/dev/null || echo 1)"
+    fi
+    mkdir -p "$HOOKS_DIR/pre" "$HOOKS_DIR/post" "$HOOKS_DIR/deploy"
+    printf '#!/bin/bash\necho hook-pre >> "$FAKE_CALLS"\n[ -e "$FAKE_STATE/hook_pre_fail" ] && exit 1\nexit 0\n' > "$HOOKS_DIR/pre/00-open-port-80.sh"
+    printf '#!/bin/bash\necho hook-post >> "$FAKE_CALLS"\nexit 0\n' > "$HOOKS_DIR/post/99-close-port-80.sh"
+    chmod 755 "$HOOKS_DIR/pre/00-open-port-80.sh" "$HOOKS_DIR/post/99-close-port-80.sh"
+    touch "$FAKE_STATE/nb_owner_netbackup"
+    echo "[ok]     repositório em /opt/netbackup"
+    if [ -e "$FAKE_STATE/deploy_erro_rc0" ]; then echo "ERRO: erro com código 0"; exit 0; fi
+    echo "[aviso]  site novo: este script NÃO recarrega o Nginx"
+    if [ -e "$FAKE_STATE/deploy_sem_tty" ]; then echo "[aviso]  sem terminal interativo; depois execute: create_admin.py"
+    elif [ -e "$FAKE_STATE/deploy_admin_existente" ]; then echo "[ok]     o banco já tem 1 usuário(s)"
+    else echo "[feito]  primeiro usuário criado"; fi
+    echo "Instalação concluída."
+    exit 0 ;;
+esac
+exit 0
+"""
 
 _listener = {}
 
@@ -150,14 +301,35 @@ class Base(unittest.TestCase):
         self.bin = self.sb / "bin"
         self.state = self.sb / "state"
         self.calls = self.sb / "calls.log"
-        for d in (self.root / "etc", self.root / "proc", self.root / "opt",
-                  self.root / "rootdir", self.inst, self.bin, self.state,
-                  self.sb / "tmp", self.sb / "home"):
-            d.mkdir(parents=True)
-        for d in (self.root, self.root / "etc", self.root / "proc", self.root / "opt",
-                  self.root / "rootdir", self.inst, self.bin, self.state,
-                  self.sb / "tmp", self.sb / "home"):
+        self.fixture = self.sb / "fixture"
+        self.zoneinfo = self.root / "zoneinfo"
+        self.le_live = self.root / "etc" / "letsencrypt" / "live"
+        self.hooks = self.root / "etc" / "letsencrypt" / "renewal-hooks"
+        self.sites_av = self.root / "etc" / "nginx" / "sites-available"
+        self.sites_en = self.root / "etc" / "nginx" / "sites-enabled"
+        self.estado_dir = self.root / "etc" / "netbackup-instalador"
+        self.share = self.root / "share" / "netbackup-instalador"
+        dirs = [self.root / "etc", self.root / "proc", self.root / "opt", self.root / "rootdir",
+                self.inst, self.bin, self.state, self.sb / "tmp", self.sb / "home",
+                self.zoneinfo / "America", self.le_live, self.sites_av, self.sites_en]
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        for d in [self.root, *dirs, self.root / "etc" / "letsencrypt", self.root / "etc" / "nginx",
+                  self.zoneinfo]:
             d.chmod(0o755)
+        for z in ("America/Sao_Paulo", "America/Manaus", "UTC"):
+            (self.zoneinfo / z).write_text("TZif")
+        for rel, txt in (("config/app_settings.conf.example", APP_SETTINGS_EXAMPLE),
+                         ("config/trusted_panel_networks.conf.example", PANEL_EXAMPLE),
+                         ("config/trusted_public_networks.conf.example", PUBLIC_EXAMPLE),
+                         ("config/trusted_private_networks.conf.example", PRIVATE_EXAMPLE),
+                         ("deploy/nginx/netbackup.conf.template", NGINX_TEMPLATE),
+                         ("deploy/deploy.sh", DEPLOY_SH)):
+            f = self.fixture / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(txt)
+        for d in [self.fixture, *self.fixture.rglob("*")]:
+            d.chmod(0o755 if d.is_dir() else 0o644)
         self.calls.write_text("")
         self.fstab = self.root / "etc" / "fstab"
         self.fstab_orig = "# fstab de teste\nUUID=aaaa-bbbb / ext4 defaults 0 1\n"
@@ -175,7 +347,8 @@ class Base(unittest.TestCase):
         self.log_dir = self.root / "rootdir"
         self.opt = self.root / "opt"
         self.nb = self.opt / "netbackup"
-        self.extra_env = {}
+        # Os testes da 3a rodam só as etapas da 3a; os da 3b (Base3b) usam a lista completa.
+        self.extra_env = {"ETAPAS_LISTA": "precheck disco chave codigo relatorio"}
         self.addCleanup(shutil.rmtree, self.sb, True)
 
     # ---- helpers ----
@@ -197,6 +370,17 @@ class Base(unittest.TestCase):
             "GH_PORT": str(_listener["port"]),
             "FAKE_CALLS": str(self.calls),
             "FAKE_STATE": str(self.state),
+            "FAKE_FIXTURE": str(self.fixture),
+            "NB_DIR": str(self.nb),
+            "ESTADO_DIR": str(self.estado_dir),
+            "SHARE_DIR": str(self.share),
+            "NGINX_SITE_DST": str(self.sites_av / "netbackup"),
+            "NGINX_SITE_LINK": str(self.sites_en / "netbackup"),
+            "NGINX_DEFAULT_LINK": str(self.sites_en / "default"),
+            "LE_LIVE": str(self.le_live),
+            "HOOKS_DIR": str(self.hooks),
+            "ZONEINFO_DIR": str(self.zoneinfo),
+            "PROVA_ESPERA": "0",
             "FSTAB_": "",
         }
         e.update(self.extra_env)
@@ -228,16 +412,11 @@ class Base(unittest.TestCase):
         return sorted(self.log_dir.glob("netbackup-instalacao-*.log"))
 
     def prepare_nb(self, remote="git@github-netbackup:glaucier/netbackup-manager.git"):
+        shutil.copytree(self.fixture, self.nb, dirs_exist_ok=True)
         (self.nb / ".git").mkdir(parents=True)
-        (self.nb / "deploy").mkdir()
         (self.nb / ".git" / "fake_remote").write_text(remote + "\n")
-        d = self.nb / "deploy" / "deploy.sh"
-        d.write_text('#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\n'
-                     'if [ -e "$FAKE_STATE/deploy_mode" ]; then cat "$FAKE_STATE/deploy_mode"; exit "$(cat "$FAKE_STATE/deploy_rc" 2>/dev/null || echo 1)"; fi\n'
-                     'echo "[falta] dominio"\necho "[falta] certificado"\nexit 3\n')
-        for p in (self.nb, self.nb / ".git", self.nb / "deploy"):
-            p.chmod(0o755)
-        d.chmod(0o644)
+        for d in [self.nb, *self.nb.rglob("*")]:
+            d.chmod(0o755 if d.is_dir() else 0o644)
 
 
 # --------------------------------------------------------------------------
@@ -253,10 +432,10 @@ class TestSegurancaDoInstalador(Base):
     def test_versao_impressa_sempre(self):
         p, out = self.run_inst("--help")
         self.assertEqual(p.returncode, 0)
-        self.assertIn("versão 0.1.0-dev", out)
+        self.assertIn("versão 0.2.0-dev", out)
         self.extra_env["FAKE_UID"] = "1000"
         p, out = self.run_inst()
-        self.assertIn("versão 0.1.0-dev", out)
+        self.assertIn("versão 0.2.0-dev", out)
 
     def test_opcao_desconhecida(self):
         p, out = self.run_inst("--xyz")
@@ -419,7 +598,7 @@ class TestProgramas(Base):
     def test_comando_ausente_e_falta_com_pacote(self):
         for var, pacote in (("CMD_GIT", "git"), ("CMD_SSH_KEYGEN", "openssh-client"),
                             ("CMD_LSBLK", "util-linux"), ("CMD_TIMEOUT", "coreutils")):
-            self.extra_env = {var: "programa-que-nao-existe"}
+            self.extra_env[var] = "programa-que-nao-existe"
             p, out = self.run_inst()
             self.assertNotEqual(p.returncode, 0, var)
             self.assertIn("programa 'programa-que-nao-existe' ausente (instale o pacote: %s)" % pacote, out)
@@ -431,7 +610,7 @@ class TestProgramas(Base):
         self.assertIn("[ok] programas necessários presentes", out)
 
     def test_lvm_so_exigido_com_disco_candidato(self):
-        self.extra_env = {"CMD_PVCREATE": "pvcreate-ausente", "CMD_MKFS": "mkfs-ausente"}
+        self.extra_env.update({"CMD_PVCREATE": "pvcreate-ausente", "CMD_MKFS": "mkfs-ausente"})
         p, out = self.run_inst()  # sem disco candidato: não exige
         self.assertEqual(p.returncode, 0, out)
         self.assertNotIn("ausente (instale", out)
@@ -445,13 +624,13 @@ class TestProgramas(Base):
     def test_lvm_nao_exigido_se_disco_ja_pronto(self):
         self.add_disk("/dev/sdb")
         self.set_state("findmnt_opt", "/dev/mapper/dados--vg-opt--lv")
-        self.extra_env = {"CMD_PVCREATE": "pvcreate-ausente"}
+        self.extra_env["CMD_PVCREATE"] = "pvcreate-ausente"
         p, out = self.run_inst("--check")
         self.assertNotIn("ausente (instale", out)
 
     def test_check_com_comando_ausente_nao_altera(self):
         self.add_disk("/dev/sdb")
-        self.extra_env = {"CMD_LVCREATE": "lvcreate-ausente", "CMD_GIT": "git-ausente"}
+        self.extra_env.update({"CMD_LVCREATE": "lvcreate-ausente", "CMD_GIT": "git-ausente"})
         before = fingerprint(self.root)
         p, out = self.run_inst("--check")
         self.assertEqual(before, fingerprint(self.root))
@@ -963,8 +1142,8 @@ class TestDeployShTrava(Base):
         p, out = self.run_inst()
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("deploy-check-ran", self.calls_text())
-        self.assertIn("deploy.sh --check: 2 pendência(s), esperadas até a Fase 3b", out)
-        self.assertIn("Fase 3b", out)
+        self.assertIn("deploy.sh --check: 2 pendência(s), esperadas até o deploy", out)
+        self.assertIn("O QUE FICOU PENDENTE", out)
         self.assertIn("Log desta execução:", out)
 
 
@@ -981,7 +1160,7 @@ class TestDeployResultado(Base):
         self.prepare_nb()
         p, out = self.run_inst()
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn("2 pendência(s), esperadas até a Fase 3b", out)
+        self.assertIn("2 pendência(s), esperadas até o deploy", out)
         self.assertNotIn("reportou ERRO", out)
 
     def test_linha_erro_termina_com_codigo_diferente_de_zero(self):
@@ -992,7 +1171,7 @@ class TestDeployResultado(Base):
         self.assertIn("deploy.sh --check reportou ERRO (código 1)", out)
         self.assertIn("ERRO: o script deve estar em /opt/netbackup/deploy", out)
         self.assertIn("NÃO é pendência", out)
-        self.assertNotIn("esperadas até a Fase 3b.", out.split("Estado das etapas")[0])
+        self.assertNotIn("esperadas até o deploy.", out.split("Estado das etapas")[0])
         self.assertIn("Estado das etapas", out)  # o relatório ainda é impresso
 
     def test_saida_inesperada_sem_itens_e_erro(self):
@@ -1027,7 +1206,7 @@ class TestLog(Base):
         self.assertRegex(logs[0].name, r"^netbackup-instalacao-\d{8}_\d{6}\.log$")
         self.assertEqual(stat.S_IMODE(logs[0].stat().st_mode), 0o600)
         txt = logs[0].read_text()
-        self.assertIn("versão 0.1.0-dev", txt)
+        self.assertIn("versão 0.2.0-dev", txt)
         self.assertIn("PERGUNTA:", txt)
         self.assertIn("== 1. Pré-checagem ==", txt)
         self.assertNotIn("FAKE-PRIVATE-KEY", txt)
