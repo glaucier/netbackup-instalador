@@ -383,7 +383,7 @@ lv_existe() { "$CMD_LVS" "$VG_NAME/$LV_NAME" >/dev/null 2>&1; }
 
 # Imprime o motivo e retorna 0 se o disco deve ser RECUSADO; 1 se é candidato.
 disco_recusa_motivo() { # $1 = /dev/xxx
-  local dev="$1" n=0 mp wf
+  local dev="$1" n=0 mp wf tam tam_mb
   while read -r _ _ mp; do
     n=$((n + 1))
     if [ "$n" -eq 1 ] && [ -n "${mp:-}" ]; then echo "montado em $mp"; return 0; fi
@@ -395,7 +395,26 @@ disco_recusa_motivo() { # $1 = /dev/xxx
   if "$CMD_PVS" --noheadings -o pv_name 2>/dev/null | tr -d ' ' | grep -qxF "$dev"; then
     echo "já faz parte de um LVM"; return 0
   fi
+  tam="$("$CMD_LSBLK" -dnbo SIZE "$dev" 2>/dev/null | head -1)"
+  tam_mb=$(( ${tam:-0} / 1048576 ))
+  if [ "$tam_mb" -le 0 ]; then echo "não foi possível ler o tamanho"; return 0; fi
+  # estimativa conservadora do espaço útil: 90% (reservado de 5% do ext4 + metadados)
+  if [ $(( tam_mb * 90 / 100 )) -lt "$DISK_MIN_MB" ]; then
+    echo "pequeno demais: $(( tam_mb / 1024 )) GiB; mínimo ~$(disco_min_gib) GiB"; return 0
+  fi
   return 1
+}
+
+disco_min_gib() { echo $(( (DISK_MIN_MB * 100 + 92160 - 1) / 92160 )); }
+
+# Discos que só foram recusados pelo tamanho: imprime "dispositivo|motivo"
+lista_recusados_tamanho() {
+  local dev tipo motivo
+  while read -r dev tipo; do
+    [ "$tipo" = "disk" ] || continue
+    motivo="$(disco_recusa_motivo "$dev")" || true
+    case "$motivo" in "pequeno demais"*) printf '%s|%s\n' "$dev" "$motivo" ;; esac
+  done < <("$CMD_LSBLK" -dnpo NAME,TYPE 2>/dev/null)
 }
 
 lista_candidatos() { # imprime "dispositivo|tamanho em GiB"
@@ -409,7 +428,7 @@ lista_candidatos() { # imprime "dispositivo|tamanho em GiB"
 }
 
 check_disco() {
-  local f ncand
+  local f ncand dev motivo
   f="$(opt_fonte)"
   if [ -n "$f" ] && fonte_e_dados "$f"; then
     item ok "$OPT_DIR montado de $VG_NAME/$LV_NAME ($f)"
@@ -425,6 +444,9 @@ check_disco() {
   else
     ncand="$(lista_candidatos | wc -l)"
     item aviso "$OPT_DIR no disco do sistema (disco de dados é opcional; candidatos: $ncand)"
+    while IFS='|' read -r dev motivo; do
+      [ -n "$dev" ] && item aviso "disco $dev recusado: $motivo"
+    done < <(lista_recusados_tamanho)
   fi
 }
 
@@ -496,6 +518,9 @@ etapa_disco_run() {
     aviso_msg "$OPT_DIR não está vazio; disco de dados RECUSADO (nada foi alterado). $OPT_DIR continua no disco do sistema."
     return 0
   fi
+  while IFS='|' read -r dev motivo; do
+    [ -n "$dev" ] && aviso_msg "disco $dev recusado: $motivo."
+  done < <(lista_recusados_tamanho)
   while IFS= read -r linha; do cands+=("$linha"); done < <(lista_candidatos)
   if [ "${#cands[@]}" -eq 0 ]; then
     aviso_msg "nenhum disco candidato (sem partição, sem assinatura, não montado, fora de LVM). $OPT_DIR ficará no disco do sistema."
@@ -552,6 +577,32 @@ chave_leitura() { # 0 = consegue ler o repositório
   return 1
 }
 
+# Descobre onde a chave está cadastrada (ssh -T) e explica por que a leitura falhou.
+DIAG_MSG=""
+chave_diagnostico() {
+  local out slug alvo
+  slug="$(repo_slug "$REPO")"
+  out="$("$CMD_TIMEOUT" 30 "$CMD_SSH" -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=15 \
+        -T "$SSH_ALIAS" 2>&1 </dev/null | tr -d '\000')"
+  registra "ssh -T: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+  alvo="$(printf '%s\n' "$out" | sed -n 's/^Hi \([^!]*\)!.*/\1/p' | head -1)"
+  if [ -n "$alvo" ]; then
+    case "$alvo" in
+      */*)
+        if [ "${alvo,,}" = "${slug,,}" ]; then
+          DIAG_MSG="a chave está cadastrada no repositório certo ($alvo), mas a leitura falhou; confira se o repositório e o branch '$BRANCH' existem (veja o log)"
+        else
+          DIAG_MSG="a chave está cadastrada em $alvo; cadastre-a em $slug e APAGUE-A de $alvo (Settings -> Deploy keys)"
+        fi ;;
+      *) DIAG_MSG="a chave está cadastrada na conta '$alvo' (chave de usuário), não como Deploy key; apague-a de lá e cadastre-a como Deploy key em $slug" ;;
+    esac
+  elif printf '%s' "$out" | grep -qi 'Permission denied'; then
+    DIAG_MSG="a chave ainda não está cadastrada em nenhum repositório (cadastre em $slug)"
+  else
+    DIAG_MSG="não foi possível identificar onde a chave está cadastrada (resposta registrada no log)"
+  fi
+}
+
 # 0 = escrita recusada (somente leitura) ; 1 = escrita ACEITA ; 2 = inconclusivo
 chave_escrita() {
   local out
@@ -586,7 +637,8 @@ check_chave() {
         *) item falta "não foi possível confirmar que a chave é somente leitura" ;;
       esac
     else
-      item falta "a chave de deploy ainda não lê o repositório (cadastrada no GitHub?)"
+      chave_diagnostico
+      item falta "a chave de deploy não lê o repositório: $DIAG_MSG"
     fi
   fi
 }
@@ -683,6 +735,8 @@ etapa_chave_run() {
         lido=1; saida "ok: leitura do repositório funcionando."
       else
         erro "não foi possível ler o repositório com a chave de deploy."
+        chave_diagnostico
+        erro "$DIAG_MSG."
       fi
     done
     [ "$lido" -eq 1 ] || die "a chave não conseguiu ler o repositório após 3 tentativas. Confira o cadastro no GitHub e rode de novo."
@@ -701,6 +755,7 @@ etapa_chave_run() {
 # Define CODIGO_ESTADO: ausente | ok | outro  (e CODIGO_MOTIVO)
 CODIGO_ESTADO=""
 CODIGO_MOTIVO=""
+DEPLOY_RESULT=""
 codigo_estado() {
   local remoto
   CODIGO_MOTIVO=""
@@ -761,7 +816,8 @@ etapa_codigo_run() {
 # ETAPA 5 - RELATÓRIO FINAL (deploy.sh --check, só leitura, com trava)
 # =============================================================================
 deploy_check() { # roda "deploy.sh --check" depois de conferir a confiança
-  local real nbreal out rc
+  local real nbreal out rc erros npend l
+  DEPLOY_RESULT=""
   if [ ! -e "$DEPLOY_SH" ]; then
     saida "deploy.sh ainda não existe ($DEPLOY_SH)."; return 1
   fi
@@ -778,8 +834,27 @@ deploy_check() { # roda "deploy.sh --check" depois de conferir a confiança
   saida "executando: deploy.sh --check (somente leitura)"
   out="$("$CMD_BASH" "$real" --check 2>&1)"; rc=$?
   saida "$out"
-  saida "deploy.sh --check terminou com código $rc (falta de configuração é esperada nesta fase)."
-  return 0
+  if [ "$rc" -eq 0 ]; then
+    DEPLOY_RESULT="ok"
+    saida "deploy.sh --check: ok, sem pendências."
+    return 0
+  fi
+  erros="$(printf '%s\n' "$out" | grep -E '^[[:space:]]*ERRO:' || true)"
+  npend="$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*\[falta\]')"
+  if [ -n "$erros" ]; then
+    DEPLOY_RESULT="erro"
+    erro "deploy.sh --check reportou ERRO (código $rc):"
+    while IFS= read -r l; do erro "  $l"; done <<<"$erros"
+    erro "isto NÃO é pendência de configuração: corrija e rode de novo. A execução termina com código diferente de 0."
+    return 1
+  elif [ "$npend" -gt 0 ]; then
+    DEPLOY_RESULT="pendencias"
+    saida "deploy.sh --check: $npend pendência(s), esperadas até a Fase 3b."
+    return 0
+  fi
+  DEPLOY_RESULT="erro"
+  erro "deploy.sh --check terminou com código $rc sem itens [falta] reconhecíveis (saída inesperada; veja acima e o log)."
+  return 1
 }
 
 check_relatorio() {
@@ -792,7 +867,12 @@ check_relatorio() {
     item falta "deploy.sh NÃO será executado: $MSG_CONFIANCA"
     return 0
   fi
-  deploy_check || item falta "deploy.sh --check não pôde ser executado"
+  deploy_check
+  case "$DEPLOY_RESULT" in
+    ok) item ok "deploy.sh --check sem pendências" ;;
+    pendencias) item aviso "deploy.sh --check com pendências (esperadas até a Fase 3b)" ;;
+    *) item falta "deploy.sh --check falhou (ERRO ou saída inesperada)" ;;
+  esac
 }
 
 resumo_etapas() {

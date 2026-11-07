@@ -73,6 +73,7 @@ case "$1" in
 esac''',
     "ssh": r'''
 case "$*" in
+  *" -T "*) cat "$FAKE_STATE/ssh_T" 2>/dev/null; exit "$(cat "$FAKE_STATE/ssh_T_rc" 2>/dev/null || echo 1)" ;;
   *git-receive-pack*)
     case "$(cat "$FAKE_STATE/write_mode" 2>/dev/null)" in
       write) echo "00abcdef refs/heads/main report-status delete-refs"; exit 0 ;;
@@ -99,7 +100,7 @@ case "$1" in
     repo="$1"; dest="$2"
     mkdir -p "$dest/.git" "$dest/deploy"
     echo "$repo" > "$dest/.git/fake_remote"
-    printf '#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\nexit 3\n' > "$dest/deploy/deploy.sh"
+    printf '#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\nif [ -e "$FAKE_STATE/deploy_mode" ]; then cat "$FAKE_STATE/deploy_mode"; exit "$(cat "$FAKE_STATE/deploy_rc" 2>/dev/null || echo 1)"; fi\necho "[falta] dominio"\necho "[falta] certificado"\nexit 3\n' > "$dest/deploy/deploy.sh"
     chmod 644 "$dest/deploy/deploy.sh"
     exit 0 ;;
 esac
@@ -231,7 +232,9 @@ class Base(unittest.TestCase):
         (self.nb / "deploy").mkdir()
         (self.nb / ".git" / "fake_remote").write_text(remote + "\n")
         d = self.nb / "deploy" / "deploy.sh"
-        d.write_text('#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\nexit 3\n')
+        d.write_text('#!/bin/sh\necho deploy-check-ran >> "$FAKE_CALLS"\n'
+                     'if [ -e "$FAKE_STATE/deploy_mode" ]; then cat "$FAKE_STATE/deploy_mode"; exit "$(cat "$FAKE_STATE/deploy_rc" 2>/dev/null || echo 1)"; fi\n'
+                     'echo "[falta] dominio"\necho "[falta] certificado"\nexit 3\n')
         for p in (self.nb, self.nb / ".git", self.nb / "deploy"):
             p.chmod(0o755)
         d.chmod(0o644)
@@ -458,6 +461,79 @@ class TestProgramas(Base):
         self.assertEqual(self.logs(), [])
 
 
+GIB = 1073741824
+
+
+def livre_mb(path):
+    return shutil.disk_usage(path).free // 1048576
+
+
+class TestTamanhoDoDisco(Base):
+    def test_disco_pequeno_recusado_com_motivo_e_nada_criado(self):
+        self.extra_env["DISK_MIN_MB"] = "10240"
+        if livre_mb(self.sb) < 11000:
+            self.skipTest("pouco espaço livre no ambiente de teste")
+        self.add_disk("/dev/sdb", size=10 * GIB)
+        p, out = self.run_inst(stdin="1\n/dev/sdb\n")
+        self.assertIn("disco /dev/sdb recusado: pequeno demais: 10 GiB; mínimo ~12 GiB", out)
+        self.assertIn("nenhum disco candidato", out)
+        self.assertNotIn("1) /dev/sdb", out)
+        for c in ("pvcreate", "vgcreate", "lvcreate", "mkfs.ext4", "mount -a"):
+            self.assertEqual(self.ncalls(c), 0, c)
+        self.assertEqual(self.fstab.read_text(), self.fstab_orig)
+
+    def test_disco_suficiente_aceito(self):
+        self.extra_env["DISK_MIN_MB"] = "10240"
+        if livre_mb(self.sb) < 11000:
+            self.skipTest("pouco espaço livre no ambiente de teste")
+        self.add_disk("/dev/sdb", size=12 * GIB)
+        p, out = self.run_inst(stdin="1\n/dev/sdb\n")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("1) /dev/sdb  (12 GiB)", out)
+        self.assertEqual(self.ncalls("pvcreate"), 1)
+
+    def test_pequeno_e_grande_so_o_grande_e_listado(self):
+        self.extra_env["DISK_MIN_MB"] = "10240"
+        if livre_mb(self.sb) < 11000:
+            self.skipTest("pouco espaço livre no ambiente de teste")
+        self.add_disk("/dev/sdb", size=10 * GIB)
+        self.add_disk("/dev/sdc", size=50 * GIB)
+        p, out = self.run_inst(stdin="nenhum\n")
+        self.assertIn("disco /dev/sdb recusado", out)
+        self.assertIn("1) /dev/sdc  (50 GiB)", out)
+        self.assertNotIn("/dev/sdb  (", out)
+
+    def test_minimo_proporcional_90_por_cento(self):
+        # 11 GiB: 11264 * 0,90 = 10137 < 10240 → recusado; 12 GiB → aceito
+        self.extra_env["DISK_MIN_MB"] = "10240"
+        if livre_mb(self.sb) < 11000:
+            self.skipTest("pouco espaço livre no ambiente de teste")
+        self.add_disk("/dev/sdb", size=11 * GIB)
+        p, out = self.run_inst(stdin="nenhum\n")
+        self.assertIn("pequeno demais: 11 GiB", out)
+
+    def test_pre_espaco_so_conta_candidato_que_passa_no_criterio(self):
+        livre = livre_mb(self.opt)
+        self.extra_env["DISK_MIN_MB"] = str(livre + 500)  # /opt atual não comporta
+        # disco pequeno (para o mínimo pedido): não é candidato → falta
+        self.add_disk("/dev/sdb", size=int((livre + 500) * 1048576 * 0.5))
+        p, out = self.run_inst("--check")
+        self.assertIn("[falta] espaço livre", out)
+        # disco grande: é candidato → só aviso
+        self.add_disk("/dev/sdc", size=int((livre + 500) * 1048576 * 1.5))
+        p, out = self.run_inst("--check")
+        self.assertIn("[aviso] espaço livre", out)
+        self.assertNotIn("[falta] espaço livre", out)
+
+    def test_check_mostra_disco_recusado_por_tamanho(self):
+        self.extra_env["DISK_MIN_MB"] = "10240"
+        self.add_disk("/dev/sdb", size=10 * GIB)
+        before = fingerprint(self.root)
+        p, out = self.run_inst("--check")
+        self.assertEqual(before, fingerprint(self.root))
+        self.assertIn("[aviso] disco /dev/sdb recusado: pequeno demais", out)
+
+
 class TestDisco(Base):
     def test_disco_com_assinatura_nao_e_candidato(self):
         self.add_disk("/dev/sdb")
@@ -579,6 +655,53 @@ class TestDisco(Base):
         p, out = self.run_inst(stdin="")
         self.assertIn("outro volume", out)
         self.assertEqual(self.ncalls("pvcreate"), 0)
+
+
+class TestDiagnosticoDaChave(Base):
+    def falha(self, ssh_t, rc="1"):
+        self.set_state("ls_fail_count", "20")
+        self.set_state("ssh_T", ssh_t)
+        self.set_state("ssh_T_rc", rc)
+
+    def test_cadastrada_no_repositorio_errado(self):
+        self.falha("Hi glaucier/netbackup-instalador! You've successfully authenticated, but GitHub does not provide shell access.\n")
+        p, out = self.run_inst(stdin="\n\n\n")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("a chave está cadastrada em glaucier/netbackup-instalador; cadastre-a em "
+                      "glaucier/netbackup-manager e APAGUE-A de glaucier/netbackup-instalador", out)
+        self.assertEqual(out.count("APAGUE-A de"), 3)  # a cada tentativa
+        self.assertIn("-T github-netbackup", self.calls_text())
+
+    def test_nao_cadastrada(self):
+        self.falha("git@github.com: Permission denied (publickey).\n", "255")
+        p, out = self.run_inst(stdin="\n\n\n")
+        self.assertIn("a chave ainda não está cadastrada em nenhum repositório", out)
+
+    def test_resposta_desconhecida_e_generica_e_vai_ao_log(self):
+        self.falha("kex_exchange_identification: Connection closed\n", "255")
+        p, out = self.run_inst(stdin="\n\n\n")
+        self.assertIn("não foi possível identificar onde a chave está cadastrada", out)
+        self.assertIn("ssh -T: kex_exchange_identification", self.logs()[0].read_text())
+
+    def test_repositorio_certo_mas_leitura_falha(self):
+        self.falha("Hi glaucier/netbackup-manager! You've successfully authenticated\n")
+        p, out = self.run_inst(stdin="\n\n\n")
+        self.assertIn("cadastrada no repositório certo", out)
+
+    def test_chave_de_conta(self):
+        self.falha("Hi alguem! You've successfully authenticated\n")
+        p, out = self.run_inst(stdin="\n\n\n")
+        self.assertIn("chave de usuário", out)
+
+    def test_check_diagnostica_sem_alterar(self):
+        self.falha("Hi glaucier/netbackup-instalador! You've successfully authenticated\n")
+        self.run_inst(stdin="\n\n\n")  # cria chave/config locais e falha na leitura
+        before = fingerprint(self.root)
+        p, out = self.run_inst("--check")
+        self.assertEqual(before, fingerprint(self.root))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("[falta] a chave de deploy não lê o repositório: a chave está cadastrada em "
+                      "glaucier/netbackup-instalador; cadastre-a em glaucier/netbackup-manager", out)
 
 
 class TestChave(Base):
@@ -840,9 +963,58 @@ class TestDeployShTrava(Base):
         p, out = self.run_inst()
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("deploy-check-ran", self.calls_text())
-        self.assertIn("deploy.sh --check terminou com código 3", out)
+        self.assertIn("deploy.sh --check: 2 pendência(s), esperadas até a Fase 3b", out)
         self.assertIn("Fase 3b", out)
         self.assertIn("Log desta execução:", out)
+
+
+class TestDeployResultado(Base):
+    def test_rc0_e_ok(self):
+        self.prepare_nb()
+        self.set_state("deploy_mode", "tudo certo\n")
+        self.set_state("deploy_rc", "0")
+        p, out = self.run_inst()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("deploy.sh --check: ok, sem pendências", out)
+
+    def test_apenas_falta_sao_pendencias_esperadas(self):
+        self.prepare_nb()
+        p, out = self.run_inst()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("2 pendência(s), esperadas até a Fase 3b", out)
+        self.assertNotIn("reportou ERRO", out)
+
+    def test_linha_erro_termina_com_codigo_diferente_de_zero(self):
+        self.prepare_nb()
+        self.set_state("deploy_mode", "ERRO: o script deve estar em /opt/netbackup/deploy\n[falta] dominio\n")
+        p, out = self.run_inst()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("deploy.sh --check reportou ERRO (código 1)", out)
+        self.assertIn("ERRO: o script deve estar em /opt/netbackup/deploy", out)
+        self.assertIn("NÃO é pendência", out)
+        self.assertNotIn("esperadas até a Fase 3b.", out.split("Estado das etapas")[0])
+        self.assertIn("Estado das etapas", out)  # o relatório ainda é impresso
+
+    def test_saida_inesperada_sem_itens_e_erro(self):
+        self.prepare_nb()
+        self.set_state("deploy_mode", "algo estranho\n")
+        p, out = self.run_inst()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("saída inesperada", out)
+
+    def test_check_com_erro_do_deploy_e_falta_e_nao_altera(self):
+        self.prepare_nb()
+        self.set_state("deploy_mode", "ERRO: quebrou\n")
+        before = fingerprint(self.root)
+        p, out = self.run_inst("--check")
+        self.assertEqual(before, fingerprint(self.root))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("[falta] deploy.sh --check falhou", out)
+
+    def test_check_com_pendencias_e_so_aviso(self):
+        self.prepare_nb()
+        p, out = self.run_inst("--check")
+        self.assertIn("[aviso] deploy.sh --check com pendências", out)
 
 
 class TestLog(Base):
