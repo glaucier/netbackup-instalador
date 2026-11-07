@@ -3,6 +3,7 @@
 Raiz falsa e comandos falsos (openssl, certbot, nginx, dig, ufw, systemctl, ip, who, ss, curl, stat...);
 nada toca o sistema real. Exemplos: RFC 5737/3849 e example.com.
 """
+import datetime
 import os
 import re
 import subprocess
@@ -719,6 +720,103 @@ class TestDeploy(Base3b):
         self.assertEqual(self.ncalls("deploy-run"), 0)
 
 
+class TestDeployScript(Base3b):
+    def test_usa_script_ligado_ao_terminal_sem_log_in(self):
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        linha = [l for l in self.calls_text().splitlines() if l.startswith("script ")]
+        self.assertEqual(len(linha), 1)
+        self.assertIn("-q -e -f -c", linha[0])
+        self.assertIn("--dominio netbackup.example.com", linha[0])
+        self.assertNotIn("--log-in", linha[0])
+        self.assertNotIn("-I ", linha[0])
+        self.assertEqual(self.ncalls("deploy-dominio"), 1)
+
+    def test_aviso_destacado_e_separado_antes_do_deploy(self):
+        p, out = self.run_full()
+        i = out.index("==================================================================")
+        self.assertTrue(out[:i].endswith("\n\n"), repr(out[i - 5:i]))
+        self.assertIn("SENHA DO ADMINISTRADOR", out)
+        self.assertIn("12 ou mais caracteres, 3 dos 4 tipos", out)
+        self.assertIn("Ela não aparece na tela e não é gravada.", out)
+        fim = out.index("Ela não aparece na tela e não é gravada.")
+        resto = out[fim:]
+        self.assertRegex(resto, r"\n=+\n\n")
+        self.assertLess(out.index("executando: deploy.sh"), i)
+        self.assertLess(fim, out.index("repositório em /opt/netbackup"))
+
+    def test_classifica_a_partir_do_arquivo_e_o_log_fica_limpo(self):
+        p, out = self.run_full()
+        self.assertEqual(self.estado_val("ADMIN"), "criado")
+        self.assertEqual(self.estado_val("DEPLOY_AVISOS"), "1")
+        log = self.logs()[-1].read_text()
+        self.assertIn("primeiro usuário criado", log)
+        self.assertNotIn("\r", log)
+        self.assertNotIn("\x1b", log)
+
+    def test_admin_existente_via_arquivo(self):
+        self.set_state("deploy_admin_existente")
+        self.run_full()
+        self.assertEqual(self.estado_val("ADMIN"), "existente")
+
+    def test_erro_no_arquivo_e_codigo_de_saida_propagado(self):
+        self.set_state("deploy_fail")
+        self.set_state("deploy_fail_rc", "7")
+        p, out = self.run_full()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("deploy.sh terminou com código 7", out)
+        self.assertIn("ERRO: falha simulada do deploy", self.logs()[-1].read_text())
+        self.assertEqual(self.estado_val("DEPLOY_FEITO"), "")
+
+    def test_erro_com_codigo_zero_pelo_arquivo_tambem_falha(self):
+        self.set_state("deploy_erro_rc0")
+        p, out = self.run_full()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("reportou ERRO", out)
+
+    def test_temporario_apagado_em_sucesso_e_em_falha(self):
+        self.run_full()
+        self.assertEqual(list(self.estado_dir.glob(".deploy.*")), [])
+        self.set_state("deploy_fail")
+        self.run_full()
+        self.assertEqual(list(self.estado_dir.glob(".deploy.*")), [])
+
+    def test_temporario_fica_em_pasta_700_do_root(self):
+        (self.bin / "script").write_text(
+            '#!/bin/sh\necho "script $*" >> "$FAKE_CALLS"\nfor f; do :; done\n'
+            'stat -c "%a" "$(dirname "$f")" > "$FAKE_STATE/modo_tmp"\n'
+            'dirname "$f" > "$FAKE_STATE/dir_tmp"\necho "[feito]  primeiro usuário criado" > "$f"\nexit 0\n')
+        self.run_full()
+        self.assertEqual((self.state / "modo_tmp").read_text().strip(), "700")
+        self.assertTrue((self.state / "dir_tmp").read_text().startswith(str(self.estado_dir)))
+
+    def test_senha_digitada_nunca_aparece_no_log_nem_na_saida_nem_no_relatorio(self):
+        self.set_state("deploy_le_senha")
+        p, out = self.run_full(stdin="SENHA-DIGITADA-XYZ-123\n")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("SENHA-DIGITADA-XYZ-123", out)
+        for lg in self.logs():
+            self.assertNotIn("SENHA-DIGITADA-XYZ-123", lg.read_text())
+        self.assertNotIn("SENHA-DIGITADA-XYZ-123", self.report.read_text())
+        self.assertNotIn("SENHA-DIGITADA-XYZ-123", self.estado.read_text())
+
+    def test_sem_script_usa_o_laco_com_aviso_destacado(self):
+        self.extra_env["CMD_SCRIPT"] = "script-que-nao-existe"
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("script(1) (util-linux) ausente", out)
+        self.assertIn("SENHA DO ADMINISTRADOR", out)
+        self.assertEqual(self.estado_val("ADMIN"), "criado")
+        self.assertEqual(self.ncalls("script "), 0)
+
+    def test_sem_script_erro_continua_falhando(self):
+        self.extra_env["CMD_SCRIPT"] = "script-que-nao-existe"
+        self.set_state("deploy_fail")
+        p, out = self.run_full()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("ERRO: falha simulada do deploy", out)
+
+
 class TestDns(Base3b):
     def roda(self):
         p, out = self.run_full()
@@ -1206,6 +1304,88 @@ class TestModoCertificado(Base3b):
         self.assertEqual(self.estado_val("HTTPS_MODO"), "definitivo")
         self.assertEqual(self.site.read_text(), site)
         self.assertEqual(self.ncalls("certbot"), n)
+
+
+class TestRelatorioDoCertificado(Base3b):
+    def prov(self):
+        self.set_state("dig_A", "198.51.100.99\n")
+        self.run_full()
+        self.set_state("dig_A", "203.0.113.10\n")
+
+    def test_provisorio_diz_vencimento_365_dias_certificado_e_hsts(self):
+        self.prov()
+        rel = self.report.read_text()
+        vence = (datetime.date.today() + datetime.timedelta(days=365)).isoformat()
+        self.assertEqual(self.estado_val("PROV_VENCE"), vence)
+        self.assertIn("O certificado provisório vence em %s (365 dias" % vence, rel)
+        self.assertIn("instalar.sh --certificado", rel)
+        self.assertIn("includeSubDomains", rel)
+        self.assertIn("BLOQUEIA o acesso", rel)
+        self.assertIn("pelo NOME com certificado provisório ou de TESTE", rel)
+        self.assertIn("use o acesso pelo IP (https://203.0.113.10:44318)", rel)
+
+    def test_a_tela_tambem_avisa_do_vencimento_e_do_hsts(self):
+        self.set_state("dig_A", "198.51.100.99\n")
+        p, out = self.run_full()
+        self.assertIn("vence em", out)
+        self.assertIn("includeSubDomains", out)
+
+    def test_certificado_regrava_o_relatorio_producao(self):
+        self.prov()
+        antes = self.report.read_text()
+        self.assertIn("PROVISÓRIO", antes)
+        p, out = self.run_inst("--certificado")
+        self.assertEqual(p.returncode, 0, out)
+        rel = self.report.read_text()
+        self.assertNotEqual(rel, antes)
+        self.assertIn("Acesse https://netbackup.example.com:44318", rel)
+        self.assertNotIn("PROVISÓRIO", rel)
+        self.assertNotIn("provisório vence", rel)
+        self.assertNotIn("includeSubDomains", rel)
+        self.assertNotIn("--certificado", rel)
+        self.assertIn("HTTPS com certificado Let's Encrypt", rel)
+        self.assertIn("(nada)", rel)
+        self.assertEqual(oct(self.report.stat().st_mode & 0o777), "0o600")
+        self.assertIn("Relatório gravado em", out)
+
+    def test_certificado_staging_regrava_com_aviso_de_teste(self):
+        self.prov()
+        self.extra_env["LE_STAGING"] = "1"
+        p, out = self.run_inst("--certificado")
+        self.assertEqual(p.returncode, 0, out)
+        rel = self.report.read_text()
+        self.assertIn("Acesse https://netbackup.example.com:44318", rel)
+        self.assertNotIn("PROVISÓRIO", rel)
+        self.assertIn("certificado de TESTE (staging)", rel)
+        self.assertIn("NÃO é confiável nos navegadores", rel)
+        self.assertIn("includeSubDomains", rel)
+        self.assertIn("https://203.0.113.10:44318", rel)
+
+    def test_staging_para_producao_regrava_sem_pendencia(self):
+        self.prov()
+        self.extra_env["LE_STAGING"] = "1"
+        self.run_inst("--certificado")
+        self.extra_env["LE_STAGING"] = "0"
+        p, out = self.run_inst("--certificado")
+        self.assertEqual(p.returncode, 0, out)
+        rel = self.report.read_text()
+        self.assertNotIn("TESTE", rel)
+        self.assertNotIn("includeSubDomains", rel)
+        self.assertIn("(nada)", rel)
+
+    def test_certificado_que_falha_nao_regrava_o_relatorio(self):
+        self.prov()
+        antes = self.report.read_text()
+        self.set_state("certbot_fail")
+        p, out = self.run_inst("--certificado")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.report.read_text(), antes)
+
+    def test_definitivo_direto_nao_tem_aviso_de_hsts(self):
+        self.run_full()
+        rel = self.report.read_text()
+        self.assertNotIn("includeSubDomains", rel)
+        self.assertNotIn("vence em", rel)
 
 
 class TestFirewall(Base3b):

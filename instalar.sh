@@ -116,6 +116,7 @@ CMD_OPENSSL="${CMD_OPENSSL:-openssl}"
 CMD_CERTBOT="${CMD_CERTBOT:-certbot}"
 CMD_NGINX="${CMD_NGINX:-nginx}"
 CMD_SHA256="${CMD_SHA256:-sha256sum}"
+CMD_SCRIPT="${CMD_SCRIPT:-script}"
 
 # Ordem das etapas. ETAPAS_LISTA (texto separado por espaços) só serve aos testes.
 ETAPAS=(precheck perguntas disco chave codigo config deploy https firewall relatorio)
@@ -1652,21 +1653,60 @@ DEPLOY_ERROS=""
 DEPLOY_AVISOS=0
 DEPLOY_ADMIN="pendente"
 
+deploy_classifica() { # $1 = linha limpa da saída do deploy.sh
+  case "$1" in
+    *ERRO:*) DEPLOY_ERROS+="$1"$'\n' ;;
+    *"[aviso]"*) DEPLOY_AVISOS=$((DEPLOY_AVISOS + 1)) ;;
+    *"primeiro usuário criado"*) DEPLOY_ADMIN="criado" ;;
+    *"o banco já tem"*) DEPLOY_ADMIN="existente" ;;
+  esac
+}
+
+deploy_aviso_senha() {
+  saida ""
+  saida "=================================================================="
+  saida " Em instantes o deploy.sh vai pedir a SENHA DO ADMINISTRADOR do painel"
+  saida " (usuário admin): 12 ou mais caracteres, 3 dos 4 tipos (minúsculas,"
+  saida " maiúsculas, números, símbolos). Digite e tecle Enter; depois repita."
+  saida " Ela não aparece na tela e não é gravada."
+  saida "=================================================================="
+  saida ""
+}
+
+# Com script(1): o deploy.sh fica ligado DIRETO ao terminal (os prompts do getpass saem na ordem
+# certa) e o script grava num temporário de pasta 700 do root só o que aparece na tela (a senha
+# não tem eco, então não é gravada; sem --log-in). Depois o conteúdo limpo (sem \r nem sequências
+# de controle) vai ao log e é classificado, e o temporário é apagado. Sem script(1): laço de leitura.
 deploy_roda() { # $1 = deploy.sh (caminho real, já confiável)
-  local rcf l rc
+  local rcf l rc tmpd arq cmdline
   DEPLOY_ERROS=""; DEPLOY_AVISOS=0; DEPLOY_ADMIN="pendente"
+  deploy_aviso_senha
+  if command -v -- "$CMD_SCRIPT" >/dev/null 2>&1; then
+    install -d -m 755 -- "$ESTADO_DIR" || die "não foi possível criar $ESTADO_DIR."
+    tmpd="$(mktemp -d "$ESTADO_DIR/.deploy.XXXXXX")" || die "não foi possível criar a pasta temporária em $ESTADO_DIR."
+    chmod 700 -- "$tmpd"
+    arq="$tmpd/saida.txt"
+    printf -v cmdline '%q %q --dominio %q' "$CMD_BASH" "$1" "$R_DOMINIO"
+    registra "EXEC (script): deploy.sh --dominio $R_DOMINIO"
+    "$CMD_SCRIPT" -q -e -f -c "$cmdline" "$arq"
+    rc=$?
+    registra "--- saída do deploy.sh (copiada do script, sem controle) ---"
+    if [ -f "$arq" ]; then
+      while IFS= read -r l || [ -n "$l" ]; do
+        registra "$l"
+        deploy_classifica "$l"
+      done < <(sed -e 's/\r//g' -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' -e 's/\x1b[()][A-Za-z0-9]//g' -- "$arq")
+    fi
+    registra "--- fim da saída do deploy.sh ---"
+    rm -rf -- "$tmpd"
+    return "$rc"
+  fi
+  aviso_msg "script(1) (util-linux) ausente: a saída do deploy.sh passa por um laço e o pedido de senha pode aparecer fora de ordem."
   rcf="$(mktemp)" || die "mktemp falhou."
   exec 4<&0
-  # A saída passa pela função saida (log por função, sem tee); o prompt da senha do
-  # admin vem do getpass do produto direto do terminal (nunca passa por aqui).
   while IFS= read -r l; do
     saida "$l"
-    case "$l" in
-      *ERRO:*) DEPLOY_ERROS+="$l"$'\n' ;;
-      *"[aviso]"*) DEPLOY_AVISOS=$((DEPLOY_AVISOS + 1)) ;;
-      *"primeiro usuário criado"*) DEPLOY_ADMIN="criado" ;;
-      *"o banco já tem"*) DEPLOY_ADMIN="existente" ;;
-    esac
+    deploy_classifica "$l"
   done < <("$CMD_BASH" "$1" --dominio "$R_DOMINIO" 2>&1 <&4; printf '%s\n' "$?" >"$rcf")
   exec 4<&-
   rc="$(cat -- "$rcf" 2>/dev/null)"
@@ -1701,8 +1741,6 @@ etapa_deploy_run() {
   [ -f "$SHARE_DIR/netbackup.conf.template" ] || die "a cópia do modelo do Nginx não existe; rode a etapa de configuração antes do deploy."
   if [ ! -t 0 ]; then
     aviso_msg "sem terminal interativo: o deploy.sh não conseguirá pedir a senha do administrador; ele avisará como criá-lo depois."
-  else
-    saida "O deploy.sh vai pedir a senha do usuário admin (12+ caracteres), digitada no terminal e nunca gravada."
   fi
   estado_set PRODUTO_COMMIT "$(git_ -C "$NB_DIR" log -1 --format=%h 2>/dev/null | head -n 1)"
   estado_set DEPLOY_TENTADO 1
@@ -1901,7 +1939,8 @@ provisorio_cert() {
       -addext "subjectAltName=$san" >/dev/null 2>&1 ) || { rm -f -- "$PROV_CRT.tmp" "$PROV_KEY.tmp"; erro "openssl não gerou o certificado provisório."; return 1; }
   chmod 600 -- "$PROV_KEY.tmp" && chmod 644 -- "$PROV_CRT.tmp" \
     && mv -f -- "$PROV_KEY.tmp" "$PROV_KEY" && mv -f -- "$PROV_CRT.tmp" "$PROV_CRT" || return 1
-  saida "-> certificado provisório (autoassinado, 365 dias) gerado em $PROVISORIO_DIR"
+  estado_set PROV_VENCE "$(date -d '+365 days' +%Y-%m-%d)"
+  saida "-> certificado provisório (autoassinado, 365 dias, vence em $(estado_get PROV_VENCE)) gerado em $PROVISORIO_DIR"
 }
 
 # Conteúdo do site a partir da CÓPIA do root do modelo (sha256 conferido), com a
@@ -2086,6 +2125,7 @@ etapa_https_run() {
   estado_set ACESSO "https://$(acesso_ip):$HTTPS_PORT"
   nginx_ativa || RC_FINAL=1
   https_prova provisorio || RC_FINAL=1
+  saida "O certificado provisório vence em $(estado_get PROV_VENCE) (365 dias). Se o domínio-pai usar HSTS com includeSubDomains, o navegador bloqueia o acesso pelo NOME: use o IP até o definitivo."
   saida "ATENÇÃO: HTTPS provisório. Acesse https://$(acesso_ip):$HTTPS_PORT (aviso do navegador esperado); quando o DNS de $R_DOMINIO apontar para esta VM, rode: bash instalar.sh --certificado"
 }
 
@@ -2134,6 +2174,7 @@ modo_certificado() {
         nginx_ativa || return 1
         https_prova definitivo || return 1
         saida "ok: certificado de produção em uso."
+        relatorio_grava
         return 0
       fi
       if cert_existe; then saida "ok: o site instalado não é provisório e há certificado em $LE_LIVE/$R_DOMINIO; nada a fazer."; return 0; fi
@@ -2152,6 +2193,8 @@ modo_certificado() {
   nginx_ativa || return 1
   https_prova definitivo || return 1
   saida "ok: agora acesse https://$R_DOMINIO:$HTTPS_PORT"
+  saida ""
+  relatorio_grava
 }
 
 # =============================================================================
@@ -2336,10 +2379,17 @@ relatorio_texto() {
   if [ "$feito_deploy" != 1 ]; then printf '  - deploy do produto (deploy.sh) ainda não executado\n'; pend=1; fi
   if [ "$hmodo" = provisorio ]; then
     printf '  - certificado definitivo: aponte o DNS de %s para esta VM e rode: bash instalar.sh --certificado\n' "${R_DOMINIO:-o painel}"
+    printf '    O certificado provisório vence em %s (365 dias depois de gerado); até lá é preciso rodar\n' "$(estado_get PROV_VENCE | sed 's/^$/(data não registrada)/')"
+    printf '    instalar.sh --certificado.\n'
     pend=1
   fi
   if [ "$ctipo" = staging ]; then
-    printf '  - o certificado é de TESTE (staging): rode sem LE_STAGING=1 para emitir o definitivo\n'; pend=1
+    printf '  - o certificado é de TESTE (staging) e NÃO é confiável nos navegadores: rode sem LE_STAGING=1 para emitir o de produção\n'; pend=1
+  fi
+  if [ "$hmodo" = provisorio ] || [ "$ctipo" = staging ]; then
+    printf '  - ATENÇÃO (HSTS): se o domínio-pai usar HSTS com includeSubDomains, o navegador BLOQUEIA o acesso\n'
+    printf '    pelo NOME com certificado provisório ou de TESTE; use o acesso pelo IP (https://%s:%s) até o\n' "$(acesso_ip)" "$HTTPS_PORT"
+    printf '    certificado definitivo.\n'
   fi
   if [ "$feito_deploy" = 1 ] && [ "$admin" != criado ] && [ "$admin" != existente ]; then
     printf '  - criar o administrador: cd %s && sudo -u %s venv/bin/python tools/create_admin.py\n' "$NB_DIR" "$APP_USER"; pend=1
@@ -2356,8 +2406,17 @@ relatorio_texto() {
   printf '  4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá).\n'
 }
 
-etapa_relatorio_run() {
+# Gera o texto, grava $RELATORIO_TXT (600) e o mostra.
+relatorio_grava() {
   local texto
+  texto="$(relatorio_texto)"
+  printf '%s\n' "$texto" | escreve_arq "$RELATORIO_TXT" 600 || die "não foi possível gravar $RELATORIO_TXT."
+  saida "$texto"
+  saida ""
+  saida "Relatório gravado em $RELATORIO_TXT (modo 600)."
+}
+
+etapa_relatorio_run() {
   saida "== 10. Relatório =="
   deploy_estado
   case "$DEPLOY_ESTADO" in
@@ -2366,11 +2425,7 @@ etapa_relatorio_run() {
   saida ""
   resumo_etapas
   saida ""
-  texto="$(relatorio_texto)"
-  printf '%s\n' "$texto" | escreve_arq "$RELATORIO_TXT" 600 || die "não foi possível gravar $RELATORIO_TXT."
-  saida "$texto"
-  saida ""
-  saida "Relatório gravado em $RELATORIO_TXT (modo 600)."
+  relatorio_grava
   saida "Log desta execução: ${LOG_FILE}"
 }
 

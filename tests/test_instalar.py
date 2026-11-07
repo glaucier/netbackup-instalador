@@ -99,6 +99,18 @@ if [ "$1" = "-t" ]; then
   fi
 fi
 exit 0''',
+    "script": r'''
+# script(1) falso: roda o comando, grava o que "aparece na tela" (com \r e sequência de controle) no arquivo e na saída.
+cmd=""; file=""
+while [ $# -gt 0 ]; do
+  case "$1" in -q|-e|-f) ;; -c) cmd="$2"; shift ;; *) file="$1" ;; esac
+  shift
+done
+bash -c "$cmd" > "$file.raw" 2>&1; rc=$?
+sed -e 's/^/\x1b[0m/' -e 's/$/\r/' "$file.raw" > "$file"
+rm -f "$file.raw"
+cat "$file"
+exit $rc''',
     "stat": r'''
 # Simula a árvore do produto passando para o usuário netbackup depois do deploy.
 if [ -e "$FAKE_STATE/nb_owner_netbackup" ]; then
@@ -241,6 +253,7 @@ case "$1" in
       touch "$FAKE_STATE/nb_owner_netbackup" "$FAKE_STATE/unit_off"
       echo "ERRO: falha simulada do deploy"; exit "$(cat "$FAKE_STATE/deploy_fail_rc" 2>/dev/null || echo 1)"
     fi
+    if [ -e "$FAKE_STATE/deploy_le_senha" ]; then read -r senha_digitada; fi
     mkdir -p "$HOOKS_DIR/pre" "$HOOKS_DIR/post" "$HOOKS_DIR/deploy"
     printf '#!/bin/bash\necho hook-pre >> "$FAKE_CALLS"\n[ -e "$FAKE_STATE/hook_pre_fail" ] && exit 1\nexit 0\n' > "$HOOKS_DIR/pre/00-open-port-80.sh"
     printf '#!/bin/bash\necho hook-post >> "$FAKE_CALLS"\nexit 0\n' > "$HOOKS_DIR/post/99-close-port-80.sh"
