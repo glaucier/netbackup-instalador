@@ -28,19 +28,26 @@ A configuração (domínio, certificado, firewall, administrador) vem na Fase 3b
 
 ## Como baixar (por TAG, com conferência)
 
-Troque `vX.Y.Z` pela tag da versão que você recebeu. Faça como root, numa pasta
-que só o root escreve:
+**Tudo roda como root, na pasta `/root/instalador`.** Entre como root uma vez e
+execute os comandos seguintes **sem `sudo`** (`/root` é 700: um usuário comum
+não consegue entrar nela). Troque `vX.Y.Z` pela tag da versão que você recebeu.
 
 ```bash
-sudo install -d -m 755 -o root -g root /root/instalador
+sudo -i
+```
+
+Já como root:
+
+```bash
+install -d -m 755 /root/instalador
 cd /root/instalador
 ```
 
 ```bash
 TAG=vX.Y.Z
 BASE=https://raw.githubusercontent.com/glaucier/netbackup-instalador/$TAG
-sudo curl -fsSLO "$BASE/instalar.sh"
-sudo curl -fsSLO "$BASE/SHA256SUMS"
+curl -fsSLO "$BASE/instalar.sh"
+curl -fsSLO "$BASE/SHA256SUMS"
 ```
 
 ```bash
@@ -51,8 +58,10 @@ Só continue se a saída for `instalar.sh: OK`.
 
 ## Como rodar
 
+Ainda como root, em `/root/instalador`:
+
 ```bash
-sudo bash instalar.sh
+bash instalar.sh
 ```
 
 O instalador pergunta o que precisa (disco de dados, cadastro da chave de deploy)
@@ -64,15 +73,28 @@ arquivo ou qualquer pasta acima dele não for do root ou tiver escrita para
 grupo/outros (por exemplo, de dentro de `/opt/netbackup`); só executa arquivos
 de `/opt/netbackup` que passem na mesma conferência.
 
+A pré-checagem confere também os programas necessários e informa o pacote do
+Ubuntu a instalar quando faltar algum (os do LVM e o `mkfs.ext4` só são exigidos
+se houver disco de dados candidato).
+
 ### Somente leitura
 
 ```bash
-sudo bash instalar.sh --check    # ok/falta por item; não altera nada
-sudo bash instalar.sh --status   # resumo do que está pronto (sem rede)
-sudo bash instalar.sh --help
+bash instalar.sh --check    # ok/falta por item; não altera nada
+bash instalar.sh --status   # resumo do que está pronto (sem rede)
+bash instalar.sh --help
 ```
 
 `--check` sai com código 1 se houver item faltando.
+
+## Limitações conhecidas
+
+- A conferência de confiança cobre o `deploy.sh` e as pastas acima dele, não os
+  arquivos que ele carrega.
+- Depois que o `deploy.sh` do produto entregar `/opt/netbackup` ao usuário
+  `netbackup`, rodar o instalador de novo é **recusado** (a pasta deixa de ser do
+  root). Será resolvido na Fase 3b.
+- Não há atualização (`git pull`) do código já instalado nesta fase.
 
 ## Variáveis (para testes)
 
