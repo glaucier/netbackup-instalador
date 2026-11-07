@@ -313,8 +313,36 @@ pre_rede() {
   fi
 }
 
+# Programas usados: "variável-do-comando|pacote do Ubuntu|grupo" (grupo "lvm" só
+# é exigido se houver disco candidato e o disco de dados ainda não estiver pronto).
+PROGRAMAS=(
+  "CMD_GIT|git|base" "CMD_SSH|openssh-client|base" "CMD_SSH_KEYSCAN|openssh-client|base"
+  "CMD_SSH_KEYGEN|openssh-client|base" "CMD_LSBLK|util-linux|base" "CMD_WIPEFS|util-linux|base"
+  "CMD_BLKID|util-linux|base" "CMD_FINDMNT|util-linux|base" "CMD_MOUNT|util-linux|base"
+  "CMD_TIMEOUT|coreutils|base" "realpath|coreutils|base" "stat|coreutils|base"
+  "awk|mawk ou gawk|base" "sed|sed|base"
+  "CMD_PVS|lvm2|lvm" "CMD_LVS|lvm2|lvm" "CMD_PVCREATE|lvm2|lvm"
+  "CMD_VGCREATE|lvm2|lvm" "CMD_LVCREATE|lvm2|lvm" "CMD_MKFS|e2fsprogs|lvm"
+)
+
+pre_programas() {
+  local entrada var pacote grupo cmd faltando=0 precisa_lvm=0
+  # lsblk/wipefs podem faltar: então não há como listar candidatos (já será "falta")
+  if [ -n "$(lista_candidatos)" ] && ! disco_pronto; then precisa_lvm=1; fi
+  for entrada in "${PROGRAMAS[@]}"; do
+    IFS='|' read -r var pacote grupo <<<"$entrada"
+    if [ "$grupo" = "lvm" ] && [ "$precisa_lvm" -eq 0 ]; then continue; fi
+    case "$var" in CMD_*) cmd="${!var}" ;; *) cmd="$var" ;; esac
+    if ! command -v -- "$cmd" >/dev/null 2>&1; then
+      item falta "programa '$cmd' ausente (instale o pacote: $pacote)"
+      faltando=1
+    fi
+  done
+  if [ "$faltando" -eq 0 ]; then item ok "programas necessários presentes"; fi
+}
+
 check_precheck() {
-  pre_so; pre_ufw; pre_relogio; pre_memoria; pre_espaco; pre_rede
+  pre_programas; pre_so; pre_ufw; pre_relogio; pre_memoria; pre_espaco; pre_rede
 }
 
 etapa_precheck_run() {
@@ -609,8 +637,12 @@ chave_prepara_local() {
       cp -p -- "$SSH_CONFIG" "$SSH_CONFIG.bak-$DATA_STAMP" || die "não foi possível copiar $SSH_CONFIG."
       saida "cópia do ssh config: $SSH_CONFIG.bak-$DATA_STAMP"
     fi
+    # O ssh vale o PRIMEIRO valor de cada opção: o bloco vai no COMEÇO do arquivo
+    # (antes de qualquer Host/Match). "Match all" encerra o bloco, para que linhas
+    # globais que já estavam no começo do arquivo continuem valendo para todos.
+    tmp="$(mktemp "$SSH_CONFIG.tmp.XXXXXX")" || die "não foi possível criar temporário em $SSH_DIR."
     {
-      printf '\n# NetBackup Manager: chave de deploy somente leitura (instalar.sh)\n'
+      printf '# NetBackup Manager: chave de deploy somente leitura (instalar.sh)\n'
       printf 'Host %s\n' "$SSH_ALIAS"
       printf '    HostName %s\n' "$GH_HOST"
       printf '    User git\n'
@@ -619,9 +651,12 @@ chave_prepara_local() {
       printf '    StrictHostKeyChecking yes\n'
       printf '    UserKnownHostsFile %s\n' "$KNOWN_HOSTS"
       printf '    HostKeyAlgorithms ssh-ed25519\n'
-    } >>"$SSH_CONFIG" || die "não foi possível gravar $SSH_CONFIG."
-    chmod 600 -- "$SSH_CONFIG"
-    saida "ok: bloco 'Host $SSH_ALIAS' acrescentado a $SSH_CONFIG."
+      printf 'Match all\n'
+      if [ -f "$SSH_CONFIG" ]; then cat -- "$SSH_CONFIG"; fi
+    } >"$tmp" || { rm -f -- "$tmp"; die "não foi possível gravar o temporário de $SSH_CONFIG."; }
+    chmod 600 -- "$tmp" || { rm -f -- "$tmp"; die "chmod falhou em $tmp."; }
+    mv -f -- "$tmp" "$SSH_CONFIG" || { rm -f -- "$tmp"; die "não foi possível substituir $SSH_CONFIG."; }
+    saida "ok: bloco 'Host $SSH_ALIAS' inserido no começo de $SSH_CONFIG."
   fi
 }
 
@@ -672,6 +707,12 @@ codigo_estado() {
   if [ ! -e "$NB_DIR" ]; then CODIGO_ESTADO="ausente"; return 0; fi
   CODIGO_ESTADO="outro"
   if [ ! -d "$NB_DIR" ]; then CODIGO_MOTIVO="$NB_DIR existe e não é uma pasta"; return 0; fi
+  if [ -z "$(find "$NB_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    # pasta vazia: serve para clonar dentro, se for do root e sem escrita g/o
+    if confia "$NB_DIR"; then CODIGO_ESTADO="ausente"
+    else CODIGO_MOTIVO="$NB_DIR existe vazia mas não é confiável: $MSG_CONFIANCA"; fi
+    return 0
+  fi
   if [ ! -e "$NB_DIR/.git" ]; then CODIGO_MOTIVO="$NB_DIR existe e não é um repositório git"; return 0; fi
   if ! confia "$NB_DIR/.git"; then CODIGO_MOTIVO="não confiável: $MSG_CONFIANCA"; return 0; fi
   remoto="$(git_ -C "$NB_DIR" remote get-url origin 2>/dev/null)"

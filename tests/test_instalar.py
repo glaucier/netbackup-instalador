@@ -412,6 +412,52 @@ class TestPrecheck(Base):
         self.assertEqual(self.ncalls("ssh-keyscan"), 0)
 
 
+class TestProgramas(Base):
+    def test_comando_ausente_e_falta_com_pacote(self):
+        for var, pacote in (("CMD_GIT", "git"), ("CMD_SSH_KEYGEN", "openssh-client"),
+                            ("CMD_LSBLK", "util-linux"), ("CMD_TIMEOUT", "coreutils")):
+            self.extra_env = {var: "programa-que-nao-existe"}
+            p, out = self.run_inst()
+            self.assertNotEqual(p.returncode, 0, var)
+            self.assertIn("programa 'programa-que-nao-existe' ausente (instale o pacote: %s)" % pacote, out)
+            self.assertEqual(self.ncalls("ssh-keyscan"), 0)
+            self.assertEqual(self.logs()[-1].exists(), True)
+
+    def test_todos_presentes(self):
+        p, out = self.run_inst("--check")
+        self.assertIn("[ok] programas necessários presentes", out)
+
+    def test_lvm_so_exigido_com_disco_candidato(self):
+        self.extra_env = {"CMD_PVCREATE": "pvcreate-ausente", "CMD_MKFS": "mkfs-ausente"}
+        p, out = self.run_inst()  # sem disco candidato: não exige
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("ausente (instale", out)
+        self.add_disk("/dev/sdb")  # com candidato: exige
+        p, out = self.run_inst()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("(instale o pacote: lvm2)", out)
+        self.assertIn("(instale o pacote: e2fsprogs)", out)
+        self.assertEqual(self.ncalls("vgcreate"), 0)
+
+    def test_lvm_nao_exigido_se_disco_ja_pronto(self):
+        self.add_disk("/dev/sdb")
+        self.set_state("findmnt_opt", "/dev/mapper/dados--vg-opt--lv")
+        self.extra_env = {"CMD_PVCREATE": "pvcreate-ausente"}
+        p, out = self.run_inst("--check")
+        self.assertNotIn("ausente (instale", out)
+
+    def test_check_com_comando_ausente_nao_altera(self):
+        self.add_disk("/dev/sdb")
+        self.extra_env = {"CMD_LVCREATE": "lvcreate-ausente", "CMD_GIT": "git-ausente"}
+        before = fingerprint(self.root)
+        p, out = self.run_inst("--check")
+        self.assertEqual(before, fingerprint(self.root))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("[falta] programa 'git-ausente' ausente (instale o pacote: git)", out)
+        self.assertIn("[falta] programa 'lvcreate-ausente' ausente (instale o pacote: lvm2)", out)
+        self.assertEqual(self.logs(), [])
+
+
 class TestDisco(Base):
     def test_disco_com_assinatura_nao_e_candidato(self):
         self.add_disk("/dev/sdb")
@@ -585,11 +631,45 @@ class TestChave(Base):
         self.assertEqual(len(baks), 1)
         self.assertEqual(baks[0].read_text(), orig)
         cfg = (self.ssh_dir / "config").read_text()
-        self.assertTrue(cfg.startswith(orig))
+        self.assertTrue(cfg.endswith(orig))
         p, out = self.run_inst()
         self.assertEqual((self.ssh_dir / "config").read_text(), cfg)
         self.assertEqual(cfg.count("Host github-netbackup"), 1)
         self.assertEqual(len(list(self.ssh_dir.glob("config.bak-*"))), 1)
+
+    def test_bloco_vai_no_comeco_antes_de_host_asterisco(self):
+        self.ssh_dir.mkdir()
+        self.ssh_dir.chmod(0o700)
+        orig = ("# meu config\nServerAliveInterval 30\n\nHost *\n    StrictHostKeyChecking no\n"
+                "    UserKnownHostsFile /dev/null\n    IdentityFile ~/.ssh/outra\n\n"
+                "Match host x\n    User y")  # sem newline final, de propósito
+        (self.ssh_dir / "config").write_bytes(orig.encode())
+        p, out = self.run_inst()
+        self.assertEqual(p.returncode, 0, out)
+        raw = (self.ssh_dir / "config").read_bytes()
+        cfg = raw.decode()
+        self.assertTrue(cfg.startswith("# NetBackup Manager"))
+        self.assertLess(cfg.index("Host github-netbackup"), cfg.index("Host *"))
+        self.assertLess(cfg.index("StrictHostKeyChecking yes"), cfg.index("StrictHostKeyChecking no"))
+        # conteúdo anterior preservado byte a byte, logo depois do bloco
+        self.assertTrue(raw.endswith(orig.encode()))
+        bloco = raw[:-len(orig.encode())].decode()
+        self.assertTrue(bloco.endswith("HostKeyAlgorithms ssh-ed25519\nMatch all\n"), bloco)
+        self.assertEqual(stat.S_IMODE((self.ssh_dir / "config").stat().st_mode), 0o600)
+        self.assertEqual(list(self.ssh_dir.glob("config.tmp.*")), [])
+        baks = list(self.ssh_dir.glob("config.bak-*"))
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(baks[0].read_bytes(), orig.encode())
+        # segunda execução: não duplica nem reescreve
+        p, out = self.run_inst()
+        self.assertEqual((self.ssh_dir / "config").read_bytes(), raw)
+        self.assertEqual(raw.decode().count("Host github-netbackup"), 1)
+
+    def test_config_inexistente_so_com_o_bloco(self):
+        p, out = self.run_inst()
+        cfg = (self.ssh_dir / "config").read_text()
+        self.assertTrue(cfg.startswith("# NetBackup Manager"))
+        self.assertEqual(list(self.ssh_dir.glob("config.bak-*")), [])
 
     def test_mostra_chave_publica_e_espera_enter(self):
         self.set_state("ls_fail_count", "1")
@@ -670,6 +750,35 @@ class TestCodigo(Base):
         self.assertIn("outro repositório", out)
         self.assertEqual(self.ncalls("git clone"), 0)
         self.assertNotIn("deploy-check-ran", self.calls_text())
+
+    def test_pasta_vazia_do_root_e_tratada_como_ausente_e_clona_dentro(self):
+        self.nb.mkdir()
+        self.nb.chmod(0o755)
+        p, out = self.run_inst()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.ncalls("git clone"), 1)
+        self.assertTrue((self.nb / ".git").is_dir())
+
+    def test_pasta_vazia_com_escrita_de_outros_para(self):
+        self.nb.mkdir()
+        self.nb.chmod(0o777)
+        p, out = self.run_inst()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("não é confiável", out)
+        self.assertEqual(self.ncalls("git clone"), 0)
+        p, out = self.run_inst("--check")
+        self.assertIn("[falta] %s existe vazia mas não é confiável" % self.nb, out)
+
+    def test_pasta_vazia_de_outro_dono_para(self):
+        if os.getuid() != 0:
+            self.skipTest("precisa de root para trocar o dono")
+        self.nb.mkdir()
+        self.nb.chmod(0o755)
+        os.chown(self.nb, 65534, 65534)
+        p, out = self.run_inst()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("não pertence ao root", out)
+        self.assertEqual(self.ncalls("git clone"), 0)
 
     def test_opt_netbackup_sem_git_para(self):
         self.nb.mkdir()
