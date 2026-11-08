@@ -1450,7 +1450,7 @@ class TestRelatorio(Base3b):
         p, out = self.run_full()
         rel = self.report.read_text()
         self.assertEqual(oct(self.report.stat().st_mode & 0o777), "0o600")
-        self.assertIn("versão 0.2.0-dev", rel)
+        self.assertIn("versão 0.2.0", rel)
         self.assertIn("abc1234", rel)
         self.assertIn("Acesse https://netbackup.example.com:44318", rel)
         self.assertIn("Login ...............: admin", rel)

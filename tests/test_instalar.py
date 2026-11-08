@@ -6,6 +6,7 @@ Sem dependências externas (somente biblioteca padrão).
 """
 import hashlib
 import os
+import re
 import shutil
 import socket
 import stat
@@ -445,10 +446,10 @@ class TestSegurancaDoInstalador(Base):
     def test_versao_impressa_sempre(self):
         p, out = self.run_inst("--help")
         self.assertEqual(p.returncode, 0)
-        self.assertIn("versão 0.2.0-dev", out)
+        self.assertIn("versão 0.2.0", out)
         self.extra_env["FAKE_UID"] = "1000"
         p, out = self.run_inst()
-        self.assertIn("versão 0.2.0-dev", out)
+        self.assertIn("versão 0.2.0", out)
 
     def test_opcao_desconhecida(self):
         p, out = self.run_inst("--xyz")
@@ -1219,7 +1220,7 @@ class TestLog(Base):
         self.assertRegex(logs[0].name, r"^netbackup-instalacao-\d{8}_\d{6}\.log$")
         self.assertEqual(stat.S_IMODE(logs[0].stat().st_mode), 0o600)
         txt = logs[0].read_text()
-        self.assertIn("versão 0.2.0-dev", txt)
+        self.assertIn("versão 0.2.0", txt)
         self.assertIn("PERGUNTA:", txt)
         self.assertIn("== 1. Pré-checagem ==", txt)
         self.assertNotIn("FAKE-PRIVATE-KEY", txt)
@@ -1263,6 +1264,14 @@ class TestArtefatos(unittest.TestCase):
                            capture_output=True, text=True, cwd=d)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(out.read_text(), (REPO_DIR / "SHA256SUMS").read_text())
+
+    def test_versao_sem_dev_e_igual_ao_topo_do_changelog(self):
+        versao = re.search(r'^VERSAO="([^"]+)"', (REPO_DIR / "instalar.sh").read_text(), re.M).group(1)
+        topo = re.search(r"^## \[([^\]]+)\] - \d{4}-\d{2}-\d{2}$", (REPO_DIR / "CHANGELOG.md").read_text(), re.M).group(1)
+        self.assertNotIn("-dev", versao)
+        self.assertEqual(versao, topo)
+        self.assertIn("TAG=v%s" % versao, (REPO_DIR / "README.md").read_text())
+        self.assertIn("Versão %s" % versao, (REPO_DIR / "README.md").read_text())
 
     def test_sem_binarios_nem_licenca_e_sem_dados_reais(self):
         tracked = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=str(REPO_DIR),
