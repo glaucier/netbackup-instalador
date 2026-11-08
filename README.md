@@ -6,7 +6,7 @@ equipamentos de rede).
 > **Software proprietário, uso sob licença.** Este repositório contém apenas o
 > instalador; o produto em si está em repositório privado e exige licença.
 
-## Estado atual: Fase 3b
+## Estado atual: Versão 0.2.0
 
 Leva a VM limpa até **"acesse https://NOME:44318"**. Ordem das etapas:
 
@@ -59,7 +59,7 @@ cd /root/instalador
 ```
 
 ```bash
-TAG=vX.Y.Z
+TAG=v0.2.0
 BASE=https://raw.githubusercontent.com/glaucier/netbackup-instalador/$TAG
 curl -fsSLO "$BASE/instalar.sh"
 curl -fsSLO "$BASE/SHA256SUMS"

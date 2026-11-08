@@ -23,7 +23,7 @@
 set -u
 export LC_ALL=C
 
-VERSAO="0.2.0-dev"
+VERSAO="0.2.0"
 
 # ---- Configuração (tudo sobrescrevível por ambiente; padrões = valores reais) --
 REPO="${REPO:-git@github-netbackup:glaucier/netbackup-manager.git}"
