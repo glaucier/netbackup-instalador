@@ -2,6 +2,53 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [Não lançado]
+
+Versão em desenvolvimento: `0.3.0-dev` (PR C3).
+
+### Adicionado
+
+- `instalar.sh --importar ARQUIVO [--homologacao] [--painel-hostname NOME[:PORTA]]`: instala
+  uma VM nova **já com os dados de outro servidor** (recuperação ou migração) usando o
+  "pacote do sistema" do produto (`tools.pacote` e `tools.manutencao`), sem passos manuais
+  além da senha do pacote.
+  - Precheck antes de qualquer alteração: o arquivo existe, é arquivo comum (sem link), legível
+    e tem nome no padrão do produto; `ARQUIVO.sha256` é conferido (sem ele: confirmação
+    explícita ou `--sem-sha256`); `gpg` para pacote `.gpg`; `sudo`.
+  - Transporte: o root só **lê**; o próprio `netbackup` grava a cópia em
+    `/home/netbackup/importar` (700, arquivo 600) por `sudo -u netbackup install/tee`, e o
+    sha256 da cópia é conferido (também pelo `netbackup`).
+  - Fluxo: instalação normal até o deploy → `importar --check` (senha pedida no terminal,
+    até 3 tentativas) → para `netbackup.service` e `netbackup-scheduler.service` → liga a
+    manutenção → importa → religa os serviços. A **manutenção continua ligada** até o
+    operador liberar; o relatório explica e mostra o botão "Liberar agendador" e o comando.
+  - A senha do pacote fica só em memória e vai à ferramenta pelo descritor 3
+    (`--senha-fd 3`): nunca em argv, disco, log, estado nem relatório.
+  - O nome do painel passa a ser o do pacote (ou o de `--painel-hostname`); a etapa HTTPS
+    usa esse nome e o instalador avisa quando ele difere do das respostas.
+  - Destino com dados (backups, usuários pré-existentes ou produto já instalado): recusa,
+    a não ser com `--forcar-importacao` (avisa que sobrepõe e pede confirmação).
+  - Cada código de saída da ferramenta (1 a 7) tem mensagem própria; no 7 o estado anterior
+    (`system_backups/pre-importacao/`) é indicado e os serviços **não** sobem. O importar
+    real nunca roda sem um `--check` com saída 0 sobre a mesma cópia.
+  - Estado e relatório registram importação sim/não, nome do arquivo (nunca a senha), origem
+    e homologação; o "CHECKLIST DO DESTINO" da ferramenta é anexado ao relatório. Em
+    homologação o relatório destaca que os agendamentos ficaram desligados.
+  - Depois do sucesso pergunta se apaga a cópia (padrão: apagar); em falha a mantém e diz onde está.
+- `--respostas`: chaves `IMPORTAR_ARQUIVO`, `IMPORTAR_HOMOLOGACAO` e `IMPORTAR_PAINEL_HOSTNAME`.
+  A senha do pacote **nunca** vai no arquivo (a chave é recusada).
+- `--check` com `--importar`: valida o arquivo e o sha256 sem alterar nada e avisa que a senha
+  será pedida na instalação.
+- Nova etapa `importar` (entre `deploy` e `https`); as etapas seguintes passam a ser 9, 10 e 11.
+
+### Limitações conhecidas (importação)
+
+- "Destino com dados" é detectado por arquivos em `/opt/netbackup/backups`, por banco que já
+  tinha usuários antes do deploy e por produto instalado fora do instalador; equipamentos
+  cadastrados sem nenhum backup não são vistos pelo instalador (só pela ferramenta do produto).
+- Importação interrompida (código 7) ou sem estado conhecido bloqueia nova tentativa com
+  `--importar`; resolva à mão e rode o instalador sem `--importar`.
+
 ## [0.2.0] - 2026-11-07
 
 Fases 3a e 3b: da VM limpa até "acesse https://NOME:44318".

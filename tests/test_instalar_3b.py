@@ -95,7 +95,8 @@ class TestFluxoCompleto(Base3b):
         p, out = self.run_full()
         self.assertEqual(p.returncode, 0, out)
         ordem = ["== 1. Pré", "== 2. Perguntas", "== 3. Disco", "== 4. Chave", "== 5. Código",
-                 "== 6. Configuração", "== 7. Deploy", "== 8. HTTPS", "== 9. Firewall", "== 10. Relatório"]
+                 "== 6. Configuração", "== 7. Deploy", "== 8. Importação", "== 9. HTTPS", "== 10. Firewall",
+                 "== 11. Relatório"]
         pos = [out.index(x) for x in ordem]
         self.assertEqual(pos, sorted(pos))
 
@@ -1450,7 +1451,7 @@ class TestRelatorio(Base3b):
         p, out = self.run_full()
         rel = self.report.read_text()
         self.assertEqual(oct(self.report.stat().st_mode & 0o777), "0o600")
-        self.assertIn("versão 0.2.0", rel)
+        self.assertIn("versão 0.3.0-dev", rel)
         self.assertIn("abc1234", rel)
         self.assertIn("Acesse https://netbackup.example.com:44318", rel)
         self.assertIn("Login ...............: admin", rel)
