@@ -90,8 +90,12 @@ case "$mod" in
     if [ "$senha" != "$(cat "$S/senha_ok" 2>/dev/null || echo 'SenhaCorreta#123')" ]; then echo "ERRO: senha do pacote incorreta"; exit 4; fi
     if [ "$check" = 1 ]; then
       [ -e "$S/pacote_check_rc" ] && { echo "ERRO: falha simulada no --check"; exit "$(cat "$S/pacote_check_rc")"; }
-      destino="${host:-$(cat "$S/dest_host" 2>/dev/null || echo origem.example.org)}"
-      echo "PANEL_HOSTNAME: origem origem.example.org → destino $destino"
+      pkg="$(cat "$S/pkg_host" 2>/dev/null || echo origem.example.org)"
+      if [ -n "$host" ]; then
+        echo "PANEL_HOSTNAME: origem $pkg → destino $host"
+      else
+        echo "PANEL_HOSTNAME: origem $pkg → destino $pkg (o pacote o traz; para trocar use --painel-hostname NOME[:PORTA])"
+      fi
       echo "pré-condições para importar: PENDENTE: manutenção desligada; serviços ativos"
       exit 0
     fi
@@ -219,7 +223,8 @@ class TestFluxoFeliz(BaseImp):
         for txt in ("Importação ..........: sim", PKG, "origem.example.org", "Homologação .........: nao",
                     'botão "Liberar agendador"', "tools.manutencao desligar", "tools.manutencao estado",
                     "CHECKLIST DO DESTINO", "[ ] conferir o rclone.conf", "[ ] revisar os agendamentos",
-                    "servidor de ORIGEM"):
+                    "servidor de ORIGEM",
+                    "vieram do PACOTE", "UFW desta VM recebeu as redes das RESPOSTAS", "Aplicar regras faltantes"):
             self.assertIn(txt, rel)
         self.assertNotIn("HOMOLOGAÇÃO: os AGENDAMENTOS", rel)
 
@@ -274,7 +279,7 @@ class TestFluxoFeliz(BaseImp):
 
 class TestNomeDoPainel(BaseImp):
     def test_nome_do_pacote_diferente_avisa_e_o_https_usa_o_dele(self):
-        self.set_state("dest_host", "novo.example.com")
+        self.set_state("pkg_host", "novo.example.com")
         p, out = self.imp()
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("DIFERENTE", out)
@@ -295,24 +300,122 @@ class TestNomeDoPainel(BaseImp):
         self.assertFalse(any("8443" in l for l in self.lines("certbot")))
 
     def test_mesmo_nome_nao_avisa(self):
-        self.set_state("dest_host", "netbackup.example.com")
+        self.set_state("pkg_host", "netbackup.example.com")
         p, out = self.imp()
         self.assertEqual(p.returncode, 0, out)
         self.assertNotIn("DIFERENTE", out)
         self.assertEqual(self.estado_val("IMPORT_DOMINIO_RESPOSTAS"), "")
 
-    def test_nome_ilegivel_na_saida_mantem_o_das_respostas(self):
-        self.set_state("dest_host", "(vazio)")
+    def test_origem_nao_definida_mantem_o_nome_das_respostas(self):
+        self.set_state("pkg_host", "(não definido)")
         p, out = self.imp()
         self.assertEqual(p.returncode, 0, out)
         self.assertTrue(any("netbackup.example.com" in l for l in self.lines("certbot")))
+        self.assertIn("não foi possível ler o nome do painel", out)
+        self.assertNotIn("DIFERENTE", out)
+        self.assertEqual(self.estado_val("IMPORT_ORIGEM"), "n/d")
+
+    def test_formato_sem_opcao_com_nome_sem_porta_e_o_sufixo_do_texto(self):
+        # "destino X (o pacote o traz; ... NOME[:PORTA])": só o 1º token vale (antes o corte em ':' pegava lixo)
+        self.set_state("pkg_host", "novo.example.com")
+        p, out = self.imp()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("DIFERENTE", out)
+        self.assertEqual(self.estado_val("ACESSO"), "https://novo.example.com:44318")
+        self.assertEqual(self.estado_val("IMPORT_PAINEL"), "novo.example.com")
+
+    def test_formato_sem_opcao_com_nome_com_porta(self):
+        self.set_state("pkg_host", "novo.example.com:8443")
+        p, out = self.imp()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.estado_val("IMPORT_PAINEL"), "novo.example.com")
+        self.assertTrue(any("novo.example.com" in l for l in self.lines("certbot")))
+        self.assertFalse(any("8443" in l for l in self.lines("certbot")))
+        self.assertEqual(self.estado_val("IMPORT_ORIGEM"), "novo.example.com:8443")
+
+    def test_formato_com_opcao_com_e_sem_porta(self):
+        for v, esperado in (("outro.example.com", "outro.example.com"), ("outro.example.com:8443", "outro.example.com")):
+            self.setUp()
+            p, out = self.imp("--painel-hostname", v)
+            self.assertEqual(p.returncode, 0, out)
+            self.assertEqual(self.estado_val("IMPORT_PAINEL"), esperado)
+            self.assertIn("--painel-hostname %s" % v, "\n".join(self.tool_calls()))
+
+    def test_origem_nao_definida_com_opcao_usa_o_nome_pedido(self):
+        self.set_state("pkg_host", "(não definido)")
+        p, out = self.imp("--painel-hostname", "outro.example.com")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.estado_val("IMPORT_PAINEL"), "outro.example.com")
+        self.assertNotIn("não foi possível ler", out)
 
     def test_falha_nao_troca_as_respostas(self):
-        self.set_state("dest_host", "novo.example.com")
+        self.set_state("pkg_host", "novo.example.com")
         self.set_state("pacote_real_rc", "7")
         p, out = self.imp()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("DOMINIO=netbackup.example.com", self.saved.read_text())
+
+
+class TestHomologacaoNomeDoPainel(BaseImp):
+    def test_homologacao_sem_nome_passa_dominio_das_respostas_e_porta_https(self):
+        self.set_state("pkg_host", "producao.example.org")
+        p, out = self.imp("--homologacao")
+        self.assertEqual(p.returncode, 0, out)
+        tools = self.tool_calls()
+        self.assertEqual(len(tools), 2)
+        for l in tools:   # no --check e no real
+            self.assertIn("--painel-hostname netbackup.example.com:44318", l)
+        self.assertIn("NÃO assume o nome da origem", out)
+        self.assertNotIn("producao.example.org:", "\n".join(tools))
+        self.assertTrue(any("netbackup.example.com" in l for l in self.lines("certbot")))
+        self.assertFalse(any("producao.example.org" in l for l in self.lines("certbot")))
+        self.assertEqual(self.estado_val("IMPORT_PAINEL"), "netbackup.example.com")
+        self.assertEqual(self.estado_val("IMPORT_PAINEL_AUTO"), "sim")
+        self.assertEqual(self.estado_val("IMPORT_DOMINIO_RESPOSTAS"), "")
+        self.assertIn("DOMINIO=netbackup.example.com", self.saved.read_text())
+        self.assertIn("NÃO é o da origem", self.report.read_text())
+
+    def test_homologacao_com_nome_pedido_nao_e_sobrescrito(self):
+        p, out = self.imp("--homologacao", "--painel-hostname", "lab.example.com:8443")
+        self.assertEqual(p.returncode, 0, out)
+        for l in self.tool_calls():
+            self.assertIn("--painel-hostname lab.example.com:8443", l)
+            self.assertNotIn("44318", l)
+        self.assertNotIn("NÃO assume o nome da origem", out)
+        self.assertEqual(self.estado_val("IMPORT_PAINEL_AUTO"), "nao")
+
+    def test_homologacao_nome_pelo_arquivo_de_respostas(self):
+        self.set_resp(RESPOSTAS_BASE + "IMPORTAR_ARQUIVO=%s\nIMPORTAR_HOMOLOGACAO=sim\nIMPORTAR_PAINEL_HOSTNAME=lab.example.com\n" % self.pkg)
+        p, out = self.run_full(stdin=SENHA + "\n\n")
+        self.assertEqual(p.returncode, 0, out)
+        for l in self.tool_calls():
+            self.assertIn("--painel-hostname lab.example.com", l)
+            self.assertNotIn("44318", l)
+
+    def test_fora_da_homologacao_vale_o_nome_do_pacote_e_nada_e_passado(self):
+        self.set_state("pkg_host", "producao.example.org")
+        p, out = self.imp()
+        self.assertEqual(p.returncode, 0, out)
+        for l in self.tool_calls():
+            self.assertNotIn("--painel-hostname", l)
+        self.assertIn("DIFERENTE", out)
+        self.assertEqual(self.estado_val("IMPORT_PAINEL"), "producao.example.org")
+        self.assertEqual(self.estado_val("IMPORT_PAINEL_AUTO"), "nao")
+
+    def test_check_do_instalador_avisa_o_que_sera_passado(self):
+        p, out = self.run_inst("--check", "--importar", str(self.pkg), "--homologacao")
+        self.assertIn("nunca o nome da origem", out)
+
+
+class TestAvisosNaTela(BaseImp):
+    def test_senha_do_admin_e_descartavel_so_com_importacao(self):
+        p, out = self.imp()
+        self.assertIn("TEMPORÁRIA", out)
+        self.assertLess(out.index("SENHA DO ADMINISTRADOR"), out.index("TEMPORÁRIA"))
+        self.assertLess(out.index("TEMPORÁRIA"), out.index("== 8. Importação"))
+        self.setUp()
+        p, out = self.run_full()
+        self.assertNotIn("TEMPORÁRIA", out)
 
 
 class TestHomologacao(BaseImp):
@@ -325,7 +428,10 @@ class TestHomologacao(BaseImp):
         rel = self.report.read_text()
         self.assertIn("Homologação .........: sim", rel)
         self.assertIn("HOMOLOGAÇÃO: os AGENDAMENTOS ficaram DESLIGADOS", rel)
-        self.assertIn("ENCERRAR a homologação", rel)
+        self.assertIn("cd %s && sudo -u %s venv/bin/python -m tools.pacote homologacao --encerrar" % (self.nb, self.me), rel)
+        self.assertIn("não religa nada sozinho", rel)
+        self.assertIn('"homologacao" sem', rel)
+        self.assertNotIn("Siga o CHECKLIST, libere", rel)
 
     def test_sem_flag_nao_passa_homologacao(self):
         p, out = self.imp()

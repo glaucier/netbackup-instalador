@@ -155,6 +155,7 @@ CLI_IMP_ARQ=""; CLI_IMP_HOMOL=0; CLI_IMP_HOST=""
 R_IMP_ARQ=""; R_IMP_HOMOL=""; R_IMP_HOST=""
 IMP_ATIVO=0; IMP_ARQ=""; IMP_HOMOL=0; IMP_HOST=""
 IMP_FORCAR=0; IMP_SEM_SHA=0
+IMP_HOST_AUTO=0         # 1 = homologação sem nome pedido: o instalador passou DOMINIO:44318
 IMP_NOME=""; IMP_DEST=""
 IMP_SHA_STATUS=""       # ok | ausente | falha
 IMP_SHA_CONFIRMADO=0    # 1 = sem .sha256, mas o operador confirmou (ou --sem-sha256)
@@ -1723,6 +1724,10 @@ deploy_aviso_senha() {
   saida " (usuário admin): 12 ou mais caracteres, 3 dos 4 tipos (minúsculas,"
   saida " maiúsculas, números, símbolos). Digite e tecle Enter; depois repita."
   saida " Ela não aparece na tela e não é gravada."
+  if [ "$IMP_ATIVO" = 1 ]; then
+    saida " ATENÇÃO (--importar): esta senha é TEMPORÁRIA. O banco será trocado pelo do pacote"
+    saida " e os logins passarão a ser os do servidor de origem."
+  fi
   saida "=================================================================="
   saida ""
 }
@@ -1843,7 +1848,6 @@ check_deploy() {
 #   - o importar real só roda depois de um "importar --check" com saída 0 sobre o MESMO arquivo.
 readonly IMP_NOME_RE='^netbackup[A-Za-z0-9._-]*-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])_([01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]-(sistema|completo)(-[0-9]+)?\.tar\.gz(\.gpg)?$'
 CHECKLIST_ARQ="${CHECKLIST_ARQ:-$ESTADO_DIR/importacao-checklist.txt}"
-IMP_CHECKLIST=""
 IMP_TENTATIVAS_SENHA=3
 
 como_app() { "$CMD_SUDO" -u "$APP_USER" -- "$@"; }
@@ -1926,7 +1930,10 @@ pre_importar() {
   if command -v -- "$CMD_SUDO" >/dev/null 2>&1; then item ok "sudo presente (a ferramenta do produto roda como $APP_USER)"
   else item falta "programa '$CMD_SUDO' ausente (instale o pacote: sudo)"; fi
   item aviso "a senha do pacote será pedida no terminal durante a instalação (este modo não a pede nem roda a ferramenta do produto)"
-  if [ "$IMP_HOMOL" = 1 ]; then item aviso "modo HOMOLOGAÇÃO: os agendamentos ficarão desligados depois da importação"; fi
+  if [ "$IMP_HOMOL" = 1 ]; then
+    item aviso "modo HOMOLOGAÇÃO: os agendamentos ficarão desligados depois da importação"
+    if [ -z "$IMP_HOST" ]; then item aviso "homologação sem --painel-hostname: será passado <domínio das respostas>:$HTTPS_PORT (nunca o nome da origem)"; fi
+  fi
   if [ -n "$IMP_HOST" ]; then item ok "nome do painel pedido para o destino: $IMP_HOST"; fi
 }
 
@@ -1977,6 +1984,7 @@ importar_transporta() {
     die "o arquivo mudou depois da conferência do .sha256 ($IMP_ARQ); nada foi copiado."
   fi
   saida "copiando o pacote para $IMPORT_DIR (gravado pelo usuário $APP_USER; o root só lê o original)..."
+  # shellcheck disable=SC2016  # o script de sh -c é de propósito literal ($1 é expandido pelo sh do netbackup)
   cat -- "$IMP_ARQ" | como_app sh -c 'umask 077; exec tee -- "$1" >/dev/null' sh "$IMP_DEST"
   rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[0]}" != 0 ] || [ "${rcs[1]}" != 0 ]; then
@@ -2031,26 +2039,33 @@ importar_msg_rc() {
   esac
 }
 
-# Procura "PANEL_HOSTNAME: origem X → destino Y" na saída do --check.
+# Procura "PANEL_HOSTNAME: origem X → destino Y" na saída do --check. Formatos reais:
+#   "... → destino Y"                                                    (com --painel-hostname)
+#   "... → destino X (o pacote o traz; para trocar use --painel-hostname NOME[:PORTA])"   (sem)
+# Só o PRIMEIRO token depois de "destino " vale (o resto é ignorado); "(não definido)" = sem nome.
 importar_le_hostname() { # $1 = saída ; define IMP_ORIGEM e IMP_DOM_EFETIVO
   local linha re='PANEL_HOSTNAME: origem (.*) (→|->) destino (.*)$' y nome
   IMP_ORIGEM=""; IMP_DOM_EFETIVO=""
   while IFS= read -r linha; do
     if [[ $linha =~ $re ]]; then
       IMP_ORIGEM="$(trim "${BASH_REMATCH[1]}")"
+      case "$IMP_ORIGEM" in "("*) IMP_ORIGEM="" ;; esac
       y="$(trim "${BASH_REMATCH[3]}")"
+      y="${y%%[[:space:]]*}"
       y="${y,,}"
       nome="${y%%:*}"
-      if dominio_valido "$nome"; then IMP_DOM_EFETIVO="$nome"; fi
+      if [[ $y != "("* ]] && dominio_valido "$nome"; then IMP_DOM_EFETIVO="$nome"; fi
       break
     fi
   done <<<"$1"
   if [ -n "$IMP_HOST" ]; then
     nome="${IMP_HOST%%:*}"
     if [ -n "$IMP_DOM_EFETIVO" ] && [ "$IMP_DOM_EFETIVO" != "$nome" ]; then
-      aviso_msg "a ferramenta informou o destino '$IMP_DOM_EFETIVO', mas --painel-hostname pediu '$nome'; vale o pedido ($nome)."
+      aviso_msg "a ferramenta informou o destino '$IMP_DOM_EFETIVO', mas o nome pedido foi '$nome'; vale o pedido ($nome)."
     fi
     IMP_DOM_EFETIVO="$nome"
+  elif [ -z "$IMP_DOM_EFETIVO" ]; then
+    aviso_msg "não foi possível ler o nome do painel do pacote na saída da ferramenta; o HTTPS manterá o nome das respostas (${R_DOMINIO:-?})."
   fi
 }
 
@@ -2120,7 +2135,6 @@ importar_nome_difere() { # $1 = nome efetivo -> aviso quando difere do das respo
 importar_checklist_guarda() { # $1 = saída da ferramenta
   local chk
   chk="$(printf '%s\n' "$1" | awk '/CHECKLIST DO DESTINO/ {f = 1; next} f && /^[[:space:]]*\[ \]/ {print}')"
-  IMP_CHECKLIST="$chk"
   if [ -n "$chk" ]; then
     printf '%s\n' "$chk" | escreve_arq "$CHECKLIST_ARQ" 600 || aviso_msg "não foi possível gravar $CHECKLIST_ARQ."
   else
@@ -2188,6 +2202,11 @@ etapa_importar_run() {
     [ "$RESP" = "sim" ] || die "importação cancelada na confirmação. Nada foi alterado."
   fi
 
+  if [ "$IMP_HOMOL" = 1 ] && [ -z "$IMP_HOST" ]; then
+    IMP_HOST="$R_DOMINIO:$HTTPS_PORT"; IMP_HOST_AUTO=1
+    saida "HOMOLOGAÇÃO: o instalador passa --painel-hostname $IMP_HOST à ferramenta (no --check e na importação) e NÃO assume o nome da origem:"
+    saida "  a cópia roda ao lado da produção; com o nome dela o certificado e o app_settings quebrariam."
+  fi
   zera_itens; QUIET_ITEMS=1; pre_importar; QUIET_ITEMS=0
   if [ "$N_FALTA" -gt 0 ]; then
     zera_itens; pre_importar
@@ -2268,6 +2287,7 @@ etapa_importar_run() {
     respostas_grava
   fi
   estado_set IMPORT_PAINEL "${IMP_DOM_EFETIVO:-$R_DOMINIO}"
+  estado_set IMPORT_PAINEL_AUTO "$([ "$IMP_HOST_AUTO" = 1 ] && echo sim || echo nao)"
   saida "ok: importação concluída (origem: ${IMP_ORIGEM:-n/d}; homologação: $([ "$IMP_HOMOL" = 1 ] && echo sim || echo nao)). Nome do painel para o HTTPS: $R_DOMINIO."
   saida "A MANUTENÇÃO CONTINUA LIGADA até você liberar (veja o relatório)."
   importar_limpeza
@@ -2895,12 +2915,18 @@ relatorio_importacao() {
       printf '    - pelo painel: botão "Liberar agendador" da faixa de manutenção; ou\n'
       printf '    - pelo terminal: cd %s && sudo -u %s venv/bin/python -m tools.manutencao desligar\n' "$NB_DIR" "$APP_USER"
       printf '    - para consultar: ... -m tools.manutencao estado   (saída 0 = desligada, 10 = ligada)\n'
+      printf '\n  REDES DO PAINEL: as config/trusted_*_networks.conf do produto vieram do PACOTE (são as da origem),\n'
+      printf '  mas o UFW desta VM recebeu as redes das RESPOSTAS. Confira no painel, em Firewall >\n'
+      printf '  "Aplicar regras faltantes".\n'
       if [ "$homol" = sim ]; then
         printf '\n  *** HOMOLOGAÇÃO: os AGENDAMENTOS ficaram DESLIGADOS de propósito. ***\n'
-        printf '  Este servidor não executa os backups agendados do servidor de origem. Liberar a manutenção NÃO\n'
-        printf '  religa os agendamentos. Para ENCERRAR a homologação e torná-lo o servidor definitivo: siga o\n'
-        printf '  CHECKLIST DO DESTINO abaixo, libere a manutenção e religue os agendamentos, deixando o\n'
-        printf '  servidor de origem sem executar os mesmos agendamentos.\n'
+        if [ "$(estado_get IMPORT_PAINEL_AUTO)" = sim ]; then
+          printf '  O nome do painel NÃO é o da origem: o instalador passou --painel-hostname %s:%s (a cópia roda ao lado da produção).\n' "$(estado_get IMPORT_PAINEL)" "$HTTPS_PORT"
+        fi
+        printf '  Liberar a manutenção NÃO religa os agendamentos. Para ENCERRAR a homologação:\n'
+        printf '    cd %s && sudo -u %s venv/bin/python -m tools.pacote homologacao --encerrar\n' "$NB_DIR" "$APP_USER"
+        printf '  (só remove o marcador e a faixa e lista o que religar; não religa nada sozinho. "homologacao" sem\n'
+        printf '  --encerrar só mostra o estado.) Siga a lista e o CHECKLIST DO DESTINO abaixo.\n'
       fi
       if [ -s "$CHECKLIST_ARQ" ]; then
         printf '\n  CHECKLIST DO DESTINO (impresso pela ferramenta do produto):\n'

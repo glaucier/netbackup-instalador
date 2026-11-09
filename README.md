@@ -195,6 +195,11 @@ nunca vai no arquivo de respostas**: é sempre pedida no terminal (sem eco).
    liberar: pelo botão **"Liberar agendador"** da faixa do painel ou por
    `cd /opt/netbackup && sudo -u netbackup venv/bin/python -m tools.manutencao desligar`
    (`... estado`: saída 0 = desligada, 10 = ligada).
+   Em **homologação**, sem `--painel-hostname`, o instalador passa
+   `--painel-hostname <domínio das respostas>:44318` (nunca o nome da origem, pois a cópia roda ao
+   lado da produção). Para encerrar: `cd /opt/netbackup && sudo -u netbackup venv/bin/python -m tools.pacote homologacao --encerrar`.
+   As redes do painel no produto vêm do pacote, mas o UFW recebe as das respostas: confira em
+   Firewall > "Aplicar regras faltantes". A senha do administrador pedida no deploy é temporária.
 6. **HTTPS** com o nome do painel do pacote (ou de `--painel-hostname`); se ele for
    diferente do nome das respostas, o instalador avisa, atualiza as respostas gravadas e
    o DNS desse nome é que precisa apontar para a VM.

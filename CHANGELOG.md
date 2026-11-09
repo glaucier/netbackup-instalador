@@ -41,6 +41,20 @@ Versão em desenvolvimento: `0.3.0-dev` (PR C3).
   será pedida na instalação.
 - Nova etapa `importar` (entre `deploy` e `https`); as etapas seguintes passam a ser 9, 10 e 11.
 
+### Importação, ajustes da revisão (v2)
+
+- Leitura do `PANEL_HOSTNAME` do `importar --check` corrigida: vale só o primeiro token depois
+  de `destino ` (a linha sem `--painel-hostname` traz um texto explicativo depois do nome, que
+  antes confundia o corte em `:`); `(não definido)` conta como sem nome (o HTTPS mantém o das respostas, com aviso).
+- Homologação nunca assume o nome da origem: sem `--painel-hostname`, o instalador passa
+  `--painel-hostname <domínio das respostas>:44318` ao `--check` e à importação e informa na tela
+  e no relatório. Recuperação/migração continuam usando o nome do pacote.
+- Relatório: encerrar a homologação com `tools.pacote homologacao --encerrar` (não religa nada
+  sozinho; `homologacao` sem `--encerrar` só mostra o estado) e aviso sobre as redes do painel
+  (produto = as do pacote; UFW = as das respostas; conferir em Firewall > "Aplicar regras faltantes").
+- Com `--importar`, o aviso antes da senha do administrador diz que ela é temporária (o banco será trocado).
+- shellcheck limpo (variável sem uso removida).
+
 ### Limitações conhecidas (importação)
 
 - "Destino com dados" é detectado por arquivos em `/opt/netbackup/backups`, por banco que já
