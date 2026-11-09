@@ -733,7 +733,20 @@ resumo_respostas() {
   for e in "${R_PRIVADAS[@]}"; do saida "      $e"; done
   saida "  Fuso horário ..........: ${R_FUSO:-(padrão do produto)}"
   saida "  Portas sugeridas no cadastro: SSH $R_PSSH, HTTPS $R_PHTTPS, HTTP $R_PHTTP, WinBox $R_PWINBOX"
-  saida "  Senha do administrador : será pedida pelo deploy.sh, digitada no terminal (nunca gravada)."
+  if [ "$IMP_ATIVO" = 1 ]; then
+    saida "  Importação ............: $IMP_NOME"
+    saida "  Homologação ...........: $([ "$IMP_HOMOL" = 1 ] && echo sim || echo não)"
+    saida "  Nome do painel no produto: $(importar_nome_painel_txt)"
+    saida "  Senha do administrador : TEMPORÁRIA (o banco será trocado pelo do pacote); pedida pelo deploy.sh no terminal (nunca gravada)."
+  else
+    saida "  Senha do administrador : será pedida pelo deploy.sh, digitada no terminal (nunca gravada)."
+  fi
+}
+
+importar_nome_painel_txt() { # o nome que será passado à ferramenta
+  if [ -n "$IMP_HOST" ]; then printf '%s (--painel-hostname)' "$IMP_HOST"
+  elif [ "$IMP_HOMOL" = 1 ]; then printf '%s:%s (homologação: automático, nunca o nome da origem)' "$R_DOMINIO" "$HTTPS_PORT"
+  else printf 'o do pacote (informado pelo importar --check)'; fi
 }
 
 perguntas_interativas() {
@@ -1380,6 +1393,55 @@ codigo_commit() {
   git_ -C "$NB_DIR" log -1 --format='%h %ad %s' --date=short 2>/dev/null
 }
 
+# Compara o clone existente com origin/$BRANCH. Define CODIGO_LOCAL, CODIGO_REMOTO e CODIGO_REL:
+#   em-dia | atras (fast-forward possível) | adiantado | divergente | diferente (só "consulta") | desconhecido
+# "fetch" (etapa) grava objetos no .git do root; "consulta" (--check) só usa ls-remote e não escreve nada.
+CODIGO_LOCAL=""; CODIGO_REMOTO=""; CODIGO_REL=""
+codigo_compara() { # $1 = fetch | consulta
+  CODIGO_REL="desconhecido"; CODIGO_REMOTO=""
+  CODIGO_LOCAL="$(git_ -C "$NB_DIR" rev-parse HEAD 2>/dev/null </dev/null | head -n 1)"
+  if [ "$1" = fetch ]; then
+    GIT_SSH_COMMAND="$(git_ssh_cmd)" git_ -C "$NB_DIR" fetch origin "$BRANCH" >/dev/null 2>&1 </dev/null || return 0
+    CODIGO_REMOTO="$(git_ -C "$NB_DIR" rev-parse 'FETCH_HEAD^{commit}' 2>/dev/null </dev/null | head -n 1)"
+  else
+    CODIGO_REMOTO="$(GIT_SSH_COMMAND="$(git_ssh_cmd)" git_ -C "$NB_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null </dev/null | awk 'NR == 1 {print $1}')"
+  fi
+  [[ $CODIGO_LOCAL =~ ^[0-9a-f]{7,64}$ ]] && [[ $CODIGO_REMOTO =~ ^[0-9a-f]{7,64}$ ]] || return 0
+  if [ "$CODIGO_LOCAL" = "$CODIGO_REMOTO" ]; then CODIGO_REL="em-dia"
+  elif ! git_ -C "$NB_DIR" cat-file -e "$CODIGO_REMOTO^{commit}" 2>/dev/null; then CODIGO_REL="diferente"
+  elif git_ -C "$NB_DIR" merge-base --is-ancestor "$CODIGO_LOCAL" "$CODIGO_REMOTO" 2>/dev/null; then CODIGO_REL="atras"
+  elif git_ -C "$NB_DIR" merge-base --is-ancestor "$CODIGO_REMOTO" "$CODIGO_LOCAL" 2>/dev/null; then CODIGO_REL="adiantado"
+  else CODIGO_REL="divergente"; fi
+}
+
+codigo_sincroniza() { # etapa: clone existente em dia com origin/$BRANCH (ou atualiza por fast-forward)
+  local l r sujo
+  saida "Conferindo se o código local está em dia com origin/$BRANCH..."
+  codigo_compara fetch
+  l="${CODIGO_LOCAL:0:7}"; r="${CODIGO_REMOTO:0:7}"
+  case "$CODIGO_REL" in
+    em-dia) saida "ok: código em dia (local $l = remoto $r)." ;;
+    adiantado) aviso_msg "o código local ($l) está À FRENTE de origin/$BRANCH ($r); seguindo com o código local." ;;
+    desconhecido) aviso_msg "não foi possível comparar com origin/$BRANCH (fetch falhou ou resposta ilegível); seguindo com o código local. Se a configuração reclamar de arquivo ausente, o código pode estar desatualizado." ;;
+    atras)
+      saida "código DESATUALIZADO: local $l, remoto $r."
+      sujo="$(git_ -C "$NB_DIR" status --porcelain --untracked-files=no 2>/dev/null </dev/null | head -n 5)"
+      if [ -n "$sujo" ]; then
+        die "o código em $NB_DIR tem alterações locais em arquivos versionados (não dá para atualizar sozinho):
+$sujo
+Guarde-as (git -C $NB_DIR stash) ou descarte-as (git -C $NB_DIR checkout -- .) e rode o instalador de novo. Nada foi alterado além do fetch."
+      fi
+      pergunta "Atualizar para $r? [S/n]" || die "entrada encerrada. Nada foi alterado além do fetch."
+      case "${RESP,,}" in
+        n|nao|não) die "código desatualizado (local $l, remoto $r) e a atualização foi recusada; a configuração precisa do código atual. Nada foi alterado além do fetch." ;;
+      esac
+      executa "$CMD_GIT" -C "$NB_DIR" merge --ff-only FETCH_HEAD || die "o merge --ff-only falhou; confira: git -C $NB_DIR status."
+      saida "ok: código atualizado para $(codigo_commit)." ;;
+    *)
+      die "o código local ($l) e origin/$BRANCH ($r) DIVERGIRAM (não há fast-forward). Resolva à mão (git -C $NB_DIR log --oneline --graph --all; git -C $NB_DIR status) ou renomeie $NB_DIR para o instalador clonar de novo, e rode-o outra vez. Nada foi alterado além do fetch." ;;
+  esac
+}
+
 check_codigo() {
   deploy_estado
   case "$DEPLOY_ESTADO" in
@@ -1391,7 +1453,18 @@ check_codigo() {
   codigo_estado
   case "$CODIGO_ESTADO" in
     ausente) item falta "código do produto ausente ($NB_DIR)" ;;
-    ok) item ok "código do produto em $NB_DIR: $(codigo_commit)" ;;
+    ok)
+      item ok "código do produto em $NB_DIR: $(codigo_commit)"
+      if [ "$CHECK_REMOTE" = 1 ]; then
+        codigo_compara consulta
+        case "$CODIGO_REL" in
+          em-dia) item ok "código em dia com origin/$BRANCH (${CODIGO_REMOTO:0:7})" ;;
+          adiantado) item aviso "código local (${CODIGO_LOCAL:0:7}) à frente de origin/$BRANCH (${CODIGO_REMOTO:0:7})" ;;
+          atras|diferente) item falta "código DESATUALIZADO: local ${CODIGO_LOCAL:0:7}, remoto ${CODIGO_REMOTO:0:7}; a instalação oferece atualizar (fast-forward) antes da configuração" ;;
+          divergente) item falta "código local (${CODIGO_LOCAL:0:7}) DIVERGE de origin/$BRANCH (${CODIGO_REMOTO:0:7}); resolva à mão" ;;
+          *) item aviso "não foi possível comparar o código com origin/$BRANCH" ;;
+        esac
+      fi ;;
     *) item falta "$CODIGO_MOTIVO" ;;
   esac
 }
@@ -1409,7 +1482,7 @@ etapa_codigo_run() {
   codigo_estado
   case "$CODIGO_ESTADO" in
     outro) die "$CODIGO_MOTIVO. Nada foi alterado." ;;
-    ok) saida "ok: $NB_DIR já é o repositório do produto; segue (sem atualizar nesta fase)." ;;
+    ok) saida "ok: $NB_DIR já é o repositório do produto."; codigo_sincroniza ;;
     ausente)
       livre="$(espaco_livre_mb)"
       if [ -z "$livre" ] || [ "$livre" -lt "$DISK_MIN_MB" ]; then
@@ -2086,6 +2159,10 @@ importar_check_ferramenta() { # roda "importar --check" (até 3 senhas); define 
     [ -z "$out" ] || saida "$out"
     case "$rc" in
       0)
+        if printf '%s\n' "$out" | grep -qi 'tem dados' && printf '%s\n' "$out" | grep -q '(1 usuário' \
+           && [ "$(estado_get ADMIN)" = criado ] && [ "$(estado_get DEPLOY_ORIGEM)" != detectado ] && [ "$(estado_get DEPLOY_FEITO)" = 1 ]; then
+          saida "(esperado: é o admin temporário criado pelo deploy agora há pouco)"
+        fi
         pre="$(printf '%s\n' "$out" | grep -E 'pré-condições para importar:' | tail -n 1)"
         if [ -z "$pre" ]; then aviso_msg "a ferramenta não informou a linha 'pré-condições para importar'."
         else case "$pre" in
@@ -3016,10 +3093,17 @@ relatorio_texto() {
   printf '\nPRÓXIMOS PASSOS\n'
   if [ "$imp" = feita ]; then printf '  1. Abra o endereço de acesso acima e entre com um usuário do servidor de origem.\n'
   else printf '  1. Abra o endereço de acesso acima e entre com o login admin.\n'; fi
-  printf '  2. No painel, ligue os módulos opcionais conforme a necessidade: backup externo,\n'
-  printf '     Telegram, e-mail, monitor etc. (nenhum vem ligado).\n'
-  printf '  3. Cadastre os equipamentos (portas sugeridas já configuradas).\n'
-  printf '  4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá).\n'
+  if [ "$imp" = feita ]; then
+    printf '  2. Siga o CHECKLIST DO DESTINO (seção IMPORTAÇÃO acima).\n'
+    printf '  3. Libere a manutenção do produto (botão "Liberar agendador" ou tools.manutencao desligar).\n'
+    printf '  4. Em homologação, encerre quando for o caso: tools.pacote homologacao --encerrar (seção IMPORTAÇÃO).\n'
+    printf '  5. Confira a tela Firewall do painel ("Aplicar regras faltantes"; as redes do pacote e as das respostas podem diferir).\n'
+  else
+    printf '  2. No painel, ligue os módulos opcionais conforme a necessidade: backup externo,\n'
+    printf '     Telegram, e-mail, monitor etc. (nenhum vem ligado).\n'
+    printf '  3. Cadastre os equipamentos (portas sugeridas já configuradas).\n'
+    printf '  4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá).\n'
+  fi
 }
 
 # Gera o texto, grava $RELATORIO_TXT (600) e o mostra.

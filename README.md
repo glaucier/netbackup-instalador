@@ -24,7 +24,7 @@ precheck → perguntas → [resumo + confirmação] → disco → chave → codi
    chave ficam no meio;
 3. **disco de dados** opcional em `/opt` (LVM + ext4);
 4. **chave de deploy** do GitHub, somente leitura;
-5. **código** do produto (clone);
+5. **código** do produto (clone; se `/opt/netbackup` já existe, é comparado com `origin/main`: em dia segue, atrás pergunta "Atualizar para Y? [S/n]" e faz `merge --ff-only`, divergente ou com alterações locais recusa antes da configuração);
 6. **config**: cria `app_settings.conf` (com `APP_SECRET_KEY` nova, 600) e os
    arquivos de redes confiáveis a partir dos modelos do próprio produto e aplica as
    respostas (fuso, portas sugeridas, `PANEL_HOSTNAME`, redes). Guarda uma cópia do
@@ -262,7 +262,7 @@ bash instalar.sh --help
 - A conferência de confiança cobre o `deploy.sh`, os ganchos do certbot e as pastas
   acima deles, não os arquivos que eles carregam.
 - Sem `dig` (pacote `bind9-dnsutils`) o DNS não é conferido e o HTTPS fica provisório.
-- Não há atualização (`git pull`) do código já instalado.
+- Não há atualização do código depois do deploy; antes dele, um clone atrasado é atualizado por fast-forward (com pergunta).
 - Importação: "destino com dados" é detectado por backups em `/opt/netbackup/backups`, banco
   que já tinha usuários antes do deploy e produto instalado fora do instalador; equipamentos
   cadastrados sem nenhum backup não são vistos pelo instalador. Uma importação interrompida

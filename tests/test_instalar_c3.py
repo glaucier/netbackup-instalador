@@ -11,8 +11,8 @@ import stat
 import unittest
 from pathlib import Path
 
-from test_instalar import fingerprint, setUpModule, tearDownModule  # noqa: F401  (listener do módulo)
-from test_instalar_3b import Base3b
+from test_instalar import FAKES, fingerprint, setUpModule, tearDownModule  # noqa: F401  (listener do módulo)
+from test_instalar_3b import Base3b, fp
 
 SENHA = "SenhaCorreta#123"
 PKG = "netbackup-20260105_101500-sistema.tar.gz.gpg"
@@ -96,6 +96,7 @@ case "$mod" in
       else
         echo "PANEL_HOSTNAME: origem $pkg → destino $pkg (o pacote o traz; para trocar use --painel-hostname NOME[:PORTA])"
       fi
+      [ -e "$S/dest_dados" ] && cat "$S/dest_dados"
       echo "pré-condições para importar: PENDENTE: manutenção desligada; serviços ativos"
       exit 0
     fi
@@ -110,6 +111,33 @@ case "$mod" in
     exit 0 ;;
 esac
 exit 2
+'''
+
+
+LOCAL_H = "a" * 40
+REMOTO_H = "b" * 40
+
+# git falso com estado do clone existente (git_local, git_remote, git_rel, git_sujo ...); o resto vem do fake padrão.
+GIT_CODIGO = r'''
+S="$FAKE_STATE"
+if [ "$1" = "-C" ]; then d="$2"; shift 2
+  case "$1" in
+    remote) cat "$d/.git/fake_remote" 2>/dev/null; exit 0 ;;
+    log) echo "abc1234 2026-01-01 commit de teste"; exit 0 ;;
+    rev-parse) case "$2" in HEAD) cat "$S/git_local" ;; FETCH_HEAD*) cat "$S/git_remote" ;; esac; exit 0 ;;
+    fetch) [ -e "$S/git_fetch_fail" ] && exit 1; exit 0 ;;
+    ls-remote) printf '%s\trefs/heads/main\n' "$(cat "$S/git_remote")"; exit 0 ;;
+    cat-file) [ -e "$S/git_remote_unknown" ] && exit 1; exit 0 ;;
+    merge-base)
+      rel="$(cat "$S/git_rel")"; loc="$(cat "$S/git_local")"; rem="$(cat "$S/git_remote")"
+      [ "$3" = "$loc" ] && [ "$4" = "$rem" ] && [ "$rel" = atras ] && exit 0
+      [ "$3" = "$rem" ] && [ "$4" = "$loc" ] && [ "$rel" = adiantado ] && exit 0
+      exit 1 ;;
+    status) [ -e "$S/git_sujo" ] && echo " M config/app_settings.conf.example"; exit 0 ;;
+    merge) cp "$S/git_remote" "$S/git_local"; touch "$S/git_merged"; exit 0 ;;
+  esac
+  exit 0
+fi
 '''
 
 
@@ -411,8 +439,9 @@ class TestAvisosNaTela(BaseImp):
     def test_senha_do_admin_e_descartavel_so_com_importacao(self):
         p, out = self.imp()
         self.assertIn("TEMPORÁRIA", out)
-        self.assertLess(out.index("SENHA DO ADMINISTRADOR"), out.index("TEMPORÁRIA"))
-        self.assertLess(out.index("TEMPORÁRIA"), out.index("== 8. Importação"))
+        bloco = out[out.index("Em instantes o deploy.sh"):out.index("== 8. Importação")]
+        self.assertIn("esta senha é TEMPORÁRIA", bloco)   # aviso no bloco do deploy, antes do pedido da senha
+        self.assertLess(bloco.index("TEMPORÁRIA"), bloco.index("=====", bloco.index("TEMPORÁRIA")) + 1)
         self.setUp()
         p, out = self.run_full()
         self.assertNotIn("TEMPORÁRIA", out)
@@ -980,6 +1009,203 @@ class TestCheckDoInstalador(BaseImp):
         p, out = self.run_inst("--status")
         self.assertEqual(p.returncode, 0)
         self.assertIn("Importação do pacote do sistema", out)
+
+
+class TestResumoERelatorio(BaseImp):
+    def test_resumo_mostra_importacao_homologacao_nome_e_senha_temporaria(self):
+        p, out = self.imp()
+        self.assertEqual(p.returncode, 0, out)
+        resumo = out[out.index("Resumo das respostas"):out.index("respostas lidas") if "respostas lidas" in out else None]
+        for txt in ("Importação ............: %s" % PKG, "Homologação ...........: não",
+                    "Nome do painel no produto: o do pacote",
+                    "TEMPORÁRIA (o banco será trocado pelo do pacote)"):
+            self.assertIn(txt, out)
+        self.assertNotIn("será pedida pelo deploy.sh, digitada no terminal", out)
+
+    def test_resumo_com_homologacao_e_nome(self):
+        p, out = self.imp("--homologacao")
+        self.assertIn("Homologação ...........: sim", out)
+        self.assertIn("Nome do painel no produto: netbackup.example.com:44318 (homologação: automático", out)
+        self.setUp()
+        p, out = self.imp("--painel-hostname", "x.example.com:8443")
+        self.assertIn("Nome do painel no produto: x.example.com:8443 (--painel-hostname)", out)
+
+    def test_resumo_sem_importacao_nao_muda(self):
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("Importação ............:", out)
+        self.assertIn("Senha do administrador : será pedida pelo deploy.sh, digitada no terminal (nunca gravada).", out)
+        self.assertNotIn("TEMPORÁRIA", out)
+
+    def test_proximos_passos_com_importacao(self):
+        p, out = self.imp()
+        rel = self.report.read_text()
+        prox = rel[rel.index("PRÓXIMOS PASSOS"):]
+        for txt in ("1. Abra o endereço de acesso acima e entre com um usuário do servidor de origem",
+                    "2. Siga o CHECKLIST DO DESTINO", "3. Libere a manutenção do produto",
+                    "4. Em homologação, encerre quando for o caso", "5. Confira a tela Firewall", "Aplicar regras faltantes"):
+            self.assertIn(txt, prox)
+        self.assertNotIn("Cadastre os equipamentos", prox)
+        self.assertNotIn("nenhum vem ligado", prox)
+
+    def test_proximos_passos_sem_importacao_nao_mudam(self):
+        p, out = self.run_full()
+        rel = self.report.read_text()
+        self.assertIn("2. No painel, ligue os módulos opcionais", rel)
+        self.assertIn("nenhum vem ligado", rel)
+        self.assertIn("3. Cadastre os equipamentos", rel)
+        self.assertIn("4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá)", rel)
+
+
+class TestAdminTemporarioEsperado(BaseImp):
+    def test_um_usuario_e_o_admin_do_deploy_e_esperado(self):
+        self.set_state("dest_dados", "AVISO: o destino JÁ tem dados (1 usuário(s), 0 equipamento(s))")
+        p, out = self.imp()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(out.count("(esperado: é o admin temporário criado pelo deploy agora há pouco)"), 1)
+        self.assertLess(out.index("JÁ tem dados"), out.index("(esperado:"))
+        self.assertLess(out.index("(esperado:"), out.index("importar --check terminou"))
+
+    def test_mais_de_um_usuario_nao_e_esperado(self):
+        self.set_state("dest_dados", "AVISO: o destino JÁ tem dados (3 usuário(s), 0 equipamento(s))")
+        p, out = self.imp()
+        self.assertNotIn("(esperado:", out)
+
+    def test_sem_aviso_da_ferramenta_nao_imprime(self):
+        p, out = self.imp()
+        self.assertNotIn("(esperado:", out)
+
+    def test_admin_nao_criado_pelo_instalador_nao_e_esperado(self):
+        self.set_state("dest_dados", "AVISO: o destino JÁ tem dados (1 usuário(s), 0 equipamento(s))")
+        self.set_state("deploy_sem_tty")   # ADMIN=pendente: o deploy não criou admin
+        p, out = self.imp()
+        self.assertNotIn("(esperado:", out)
+
+
+class TestCodigoDesatualizado(Base3b):
+    def setUp(self):
+        super().setUp()
+        self.extra_env["ETAPAS_LISTA"] = "precheck perguntas disco chave codigo config"
+        f = self.bin / "git"
+        f.write_text('#!/bin/sh\necho "git $*" >> "$FAKE_CALLS"\n' + GIT_CODIGO + FAKES["git"] + "\n")
+        f.chmod(0o755)
+        self.prepare_nb()
+        self.set_state("git_local", LOCAL_H)
+        self.set_state("git_remote", REMOTO_H)
+        self.set_state("git_rel", "atras")
+
+    def merges(self):
+        return [l for l in self.calls_text().splitlines() if l.startswith("git") and " merge " in l]
+
+    def test_em_dia(self):
+        self.set_state("git_remote", LOCAL_H)
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("código em dia (local aaaaaaa = remoto aaaaaaa)", out)
+        self.assertNotIn("Atualizar para", out)
+        self.assertEqual(self.merges(), [])
+
+    def test_atras_com_fast_forward_pergunta_e_atualiza(self):
+        p, out = self.run_full(stdin="\n")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("local aaaaaaa, remoto bbbbbbb", out)
+        self.assertIn("Atualizar para bbbbbbb? [S/n]", out)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertIn("merge --ff-only FETCH_HEAD", self.merges()[0])
+        self.assertIn("código atualizado", out)
+        self.assertIn("== 6. Configuração", out)
+        self.assertEqual((self.state / "git_local").read_text(), REMOTO_H)
+
+    def test_atras_resposta_sim_explicita(self):
+        p, out = self.run_full(stdin="s\n")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_atras_recusando_para_antes_da_config(self):
+        p, out = self.run_full(stdin="n\n")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("atualização foi recusada", out)
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("== 6. Configuração", out)
+        self.assertFalse(self.conf.exists() and (self.conf / "app_settings.conf").exists())
+
+    def test_atras_sem_resposta_para(self):
+        p, out = self.run_full(stdin="")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("== 6. Configuração", out)
+
+    def test_divergente_recusa_com_instrucao_antes_da_config(self):
+        self.set_state("git_rel", "divergente")
+        p, out = self.run_full(stdin="\n")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("DIVERGIRAM", out)
+        self.assertIn("git -C %s" % self.nb, out)
+        self.assertNotIn("Atualizar para", out)
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("== 6. Configuração", out)
+
+    def test_alteracao_local_recusa_antes_da_config(self):
+        self.set_state("git_sujo")
+        p, out = self.run_full(stdin="\n")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("alterações locais", out)
+        self.assertIn("app_settings.conf.example", out)
+        self.assertIn("stash", out)
+        self.assertNotIn("Atualizar para", out)
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("== 6. Configuração", out)
+
+    def test_alteracao_local_com_clone_em_dia_nao_atrapalha(self):
+        self.set_state("git_sujo")
+        self.set_state("git_remote", LOCAL_H)
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+
+    def test_local_a_frente_so_avisa(self):
+        self.set_state("git_rel", "adiantado")
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("À FRENTE", out)
+        self.assertEqual(self.merges(), [])
+
+    def test_fetch_que_falha_so_avisa(self):
+        self.set_state("git_fetch_fail")
+        p, out = self.run_full()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("não foi possível comparar", out)
+
+    def test_check_apenas_informa_sem_escrever(self):
+        antes = fp(self.nb)
+        p, out = self.run_inst("--check")
+        self.assertIn("[falta] código DESATUALIZADO: local aaaaaaa, remoto bbbbbbb", out)
+        self.assertEqual(fp(self.nb), antes)
+        calls = self.calls_text()
+        self.assertNotIn(" fetch ", calls)
+        self.assertEqual(self.merges(), [])
+        self.assertIn("ls-remote origin refs/heads/main", calls)
+
+    def test_check_em_dia(self):
+        self.set_state("git_remote", LOCAL_H)
+        p, out = self.run_inst("--check")
+        self.assertIn("[ok] código em dia com origin/main (aaaaaaa)", out)
+
+    def test_check_objeto_remoto_desconhecido_e_desatualizado(self):
+        self.set_state("git_remote_unknown")
+        p, out = self.run_inst("--check")
+        self.assertIn("[falta] código DESATUALIZADO", out)
+
+    def test_check_divergente_e_a_frente(self):
+        self.set_state("git_rel", "divergente")
+        p, out = self.run_inst("--check")
+        self.assertIn("[falta] código local (aaaaaaa) DIVERGE", out)
+        self.set_state("git_rel", "adiantado")
+        p, out = self.run_inst("--check")
+        self.assertIn("[aviso] código local (aaaaaaa) à frente", out)
+
+    def test_status_nao_consulta_a_rede(self):
+        p, out = self.run_inst("--status")
+        self.assertNotIn("ls-remote origin", self.calls_text())
 
 
 class TestInterrompida(BaseImp):

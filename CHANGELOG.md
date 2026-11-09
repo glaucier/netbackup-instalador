@@ -55,6 +55,20 @@ Versão em desenvolvimento: `0.3.0-dev` (PR C3).
 - Com `--importar`, o aviso antes da senha do administrador diz que ela é temporária (o banco será trocado).
 - shellcheck limpo (variável sem uso removida).
 
+### Importação, ajustes do teste real (v3)
+
+- Código do produto: um clone existente agora é comparado com `origin/<branch>` (fetch). Em dia: segue.
+  Atrás com fast-forward possível e sem alterações locais: mostra "local X, remoto Y", pergunta
+  "Atualizar para Y? [S/n]" e faz `merge --ff-only`. Divergente ou com alterações locais em arquivos
+  versionados: recusa com instrução, **antes** da etapa de configuração. Local à frente ou fetch
+  que falha: só avisa. Com `--check` só informa (usa `ls-remote`, não escreve nada).
+- Resumo das respostas com `--importar`: linhas "Importação", "Homologação" e "Nome do painel no
+  produto"; a senha do administrador aparece como TEMPORÁRIA.
+- Depois do `importar --check`, quando a ferramenta avisa que o destino já tem 1 usuário e ele é o
+  admin criado agora pelo deploy, o instalador imprime que isso é esperado.
+- Relatório com importação: "Próximos passos" próprios (usuário da origem, CHECKLIST, liberar a
+  manutenção, encerrar a homologação, conferir o Firewall). Sem importação nada muda.
+
 ### Limitações conhecidas (importação)
 
 - "Destino com dados" é detectado por arquivos em `/opt/netbackup/backups`, por banco que já
