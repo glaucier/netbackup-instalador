@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# NetBackup Manager - instalador (FASE 3b: da VM limpa até "acesse https://NOME:44318")
+# NetBackup Manager - instalador (da VM limpa até "acesse https://NOME:44318"; opcionalmente já com
+# os dados de outro servidor: --importar)
 #
 # Software proprietário, uso sob licença. Este arquivo é só o instalador.
 #
 # Uso:  sudo bash instalar.sh [--respostas ARQUIVO | --certificado | --check | --status | -h]
+#       sudo bash instalar.sh --importar ARQUIVO [--homologacao] [--painel-hostname NOME[:PORTA]]
+#                             [--forcar-importacao] [--sem-sha256] [--respostas ARQUIVO | --check]
 #
 # Organização:
 #   - cada etapa tem  check_<etapa>  (SÓ LEITURA, imprime ok/falta/aviso por item)
 #     e  etapa_<etapa>_run  (age, depois de conferir o estado: idempotente);
 #   - a lista ETAPAS define a ordem: precheck, perguntas (e confirmação), disco,
-#     chave, codigo, config, deploy, https, firewall, relatorio. Toda PERGUNTA vem
+#     chave, codigo, config, deploy, importar, https, firewall, relatorio. Toda PERGUNTA vem
 #     antes de qualquer alteração (só a escolha do disco e o cadastro da chave
 #     ficam no meio);
 #   - estado conferível: --check (detalhado) e --status (resumo, sem rede);
@@ -23,7 +26,7 @@
 set -u
 export LC_ALL=C
 
-VERSAO="0.2.0"
+VERSAO="0.3.0-dev"
 
 # ---- Configuração (tudo sobrescrevível por ambiente; padrões = valores reais) --
 REPO="${REPO:-git@github-netbackup:glaucier/netbackup-manager.git}"
@@ -63,6 +66,12 @@ LE_LIVE="${LE_LIVE:-/etc/letsencrypt/live}"
 HOOKS_DIR="${HOOKS_DIR:-/etc/letsencrypt/renewal-hooks}"
 DNS_RESOLVERS="${DNS_RESOLVERS:-1.1.1.1 8.8.8.8}"
 LE_STAGING="${LE_STAGING:-0}"            # 1 = certbot --staging (bancada; não gasta limite)
+# Importação (--importar): a cópia do pacote fica numa pasta do PRÓPRIO usuário netbackup (700);
+# o root só LÊ o arquivo de origem e nunca escreve nessa pasta (tudo via "sudo -u netbackup").
+IMPORT_DIR="${IMPORT_DIR:-/home/$APP_USER/importar}"
+BACKUPS_DIR="${BACKUPS_DIR:-$NB_DIR/backups}"
+PRE_IMPORT_DIR="${PRE_IMPORT_DIR:-$NB_DIR/system_backups/pre-importacao}"
+SERVICOS_APP=(netbackup.service netbackup-scheduler.service)
 HTTPS_PORT=44318
 readonly UFW_COMMENT="NetBackup HTTPS (Nginx) - painel"   # o MESMO texto da tela Firewall do produto
 readonly NGINX_MARK='@SERVER_NAME@'
@@ -117,9 +126,11 @@ CMD_CERTBOT="${CMD_CERTBOT:-certbot}"
 CMD_NGINX="${CMD_NGINX:-nginx}"
 CMD_SHA256="${CMD_SHA256:-sha256sum}"
 CMD_SCRIPT="${CMD_SCRIPT:-script}"
+CMD_SUDO="${CMD_SUDO:-sudo}"
+CMD_GPG="${CMD_GPG:-gpg}"
 
 # Ordem das etapas. ETAPAS_LISTA (texto separado por espaços) só serve aos testes.
-ETAPAS=(precheck perguntas disco chave codigo config deploy https firewall relatorio)
+ETAPAS=(precheck perguntas disco chave codigo config deploy importar https firewall relatorio)
 if [ -n "${ETAPAS_LISTA:-}" ]; then read -r -a ETAPAS <<<"$ETAPAS_LISTA"; fi
 
 # ---- Estado global -----------------------------------------------------------
@@ -137,6 +148,20 @@ RC_FINAL=0
 DATA_STAMP=""
 RESPOSTAS_ARQ=""        # --respostas ARQUIVO
 R_CARREGADAS=0
+
+# Importação de pacote do sistema (--importar). CLI_* = linha de comando; R_IMP_* = arquivo de respostas;
+# IMP_* = valores finais (a linha de comando vale mais que o arquivo de respostas).
+CLI_IMP_ARQ=""; CLI_IMP_HOMOL=0; CLI_IMP_HOST=""
+R_IMP_ARQ=""; R_IMP_HOMOL=""; R_IMP_HOST=""
+IMP_ATIVO=0; IMP_ARQ=""; IMP_HOMOL=0; IMP_HOST=""
+IMP_FORCAR=0; IMP_SEM_SHA=0
+IMP_HOST_AUTO=0         # 1 = homologação sem nome pedido: o instalador passou DOMINIO:44318
+IMP_NOME=""; IMP_DEST=""
+IMP_SHA_STATUS=""       # ok | ausente | falha
+IMP_SHA_CONFIRMADO=0    # 1 = sem .sha256, mas o operador confirmou (ou --sem-sha256)
+IMP_SHA_ESPERADO=""
+IMP_ORIGEM=""; IMP_DOM_EFETIVO=""
+SENHA_PACOTE=""         # só em memória; nunca exportada, gravada, logada nem passada em argv
 
 # ---- Saída e log -------------------------------------------------------------
 # O log é escrito por estas funções (nunca por redirecionamento da saída toda).
@@ -336,6 +361,18 @@ dominio_valido() {
   [[ $d =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
+# NOME[:PORTA] do painel (como o --painel-hostname do produto); imprime a forma normalizada.
+host_painel_valido() {
+  local v="${1,,}" nome porta=""
+  nome="${v%%:*}"
+  if [[ $v == *:* ]]; then
+    porta="${v#*:}"
+    porta_valida "$porta" || return 1
+  fi
+  dominio_valido "$nome" || return 1
+  printf '%s' "$nome${porta:+:$porta}"
+}
+
 email_valido() {
   local e=$1
   [ "${#e}" -le 254 ] || return 1
@@ -465,6 +502,7 @@ RESP_ERROS=()
 resp_limpa() {
   R_DOMINIO=""; R_EMAIL=""; R_FUSO=""; R_PSSH=""; R_PHTTPS=""; R_PHTTP=""; R_PWINBOX=""
   R_PAINEL=(); R_PUBLICAS=(); R_PRIVADAS=(); R_CARREGADAS=0
+  R_IMP_ARQ=""; R_IMP_HOMOL=""; R_IMP_HOST=""
 }
 
 resp_erro() { RESP_ERROS+=("$*"); }
@@ -480,7 +518,7 @@ resp_ja_tem() { # $1 = nome do array ; $2 = entrada "CIDR  desc" -> 0 se a rede 
 
 # Lê e valida o arquivo inteiro; nada é executado. Retorna 1 se houver erro (RESP_ERROS).
 respostas_le() { # $1 = arquivo
-  local f=$1 n=0 linha chave valor
+  local f=$1 n=0 linha chave valor v
   resp_limpa; RESP_ERROS=()
   if [ ! -f "$f" ] || [ -L "$f" ]; then resp_erro "arquivo de respostas não encontrado (ou é link): $f"; return 1; fi
   while IFS= read -r linha || [ -n "$linha" ]; do
@@ -511,6 +549,22 @@ respostas_le() { # $1 = arquivo
           PORTA_SSH) R_PSSH="$valor" ;; PORTA_HTTPS) R_PHTTPS="$valor" ;;
           PORTA_HTTP) R_PHTTP="$valor" ;; PORTA_WINBOX) R_PWINBOX="$valor" ;;
         esac ;;
+      IMPORTAR_ARQUIVO)
+        [ -z "$R_IMP_ARQ" ] || { resp_erro "linha $n: IMPORTAR_ARQUIVO repetido"; continue; }
+        if [ -n "$valor" ]; then R_IMP_ARQ="$valor"; else resp_erro "linha $n: IMPORTAR_ARQUIVO vazio"; fi ;;
+      IMPORTAR_HOMOLOGACAO)
+        [ -z "$R_IMP_HOMOL" ] || { resp_erro "linha $n: IMPORTAR_HOMOLOGACAO repetido"; continue; }
+        case "${valor,,}" in
+          sim|s|1|true|yes) R_IMP_HOMOL=1 ;;
+          nao|não|n|0|false|no) R_IMP_HOMOL=0 ;;
+          *) resp_erro "linha $n: IMPORTAR_HOMOLOGACAO deve ser sim ou nao" ;;
+        esac ;;
+      IMPORTAR_PAINEL_HOSTNAME)
+        [ -z "$R_IMP_HOST" ] || { resp_erro "linha $n: IMPORTAR_PAINEL_HOSTNAME repetido"; continue; }
+        if v="$(host_painel_valido "$valor")"; then R_IMP_HOST="$v"
+        else resp_erro "linha $n: IMPORTAR_PAINEL_HOSTNAME inválido (use NOME ou NOME:PORTA, nome em minúsculas com ponto)"; fi ;;
+      IMPORTAR_SENHA*|SENHA_PACOTE*|IMPORTAR_PASSWORD*)
+        resp_erro "linha $n: a senha do pacote NUNCA vai no arquivo de respostas; ela é sempre pedida no terminal" ;;
       REDES_PAINEL|REDES_PUBLICAS|REDES_PRIVADAS)
         local tipo alvo
         case "$chave" in
@@ -679,7 +733,20 @@ resumo_respostas() {
   for e in "${R_PRIVADAS[@]}"; do saida "      $e"; done
   saida "  Fuso horário ..........: ${R_FUSO:-(padrão do produto)}"
   saida "  Portas sugeridas no cadastro: SSH $R_PSSH, HTTPS $R_PHTTPS, HTTP $R_PHTTP, WinBox $R_PWINBOX"
-  saida "  Senha do administrador : será pedida pelo deploy.sh, digitada no terminal (nunca gravada)."
+  if [ "$IMP_ATIVO" = 1 ]; then
+    saida "  Importação ............: $IMP_NOME"
+    saida "  Homologação ...........: $([ "$IMP_HOMOL" = 1 ] && echo sim || echo não)"
+    saida "  Nome do painel no produto: $(importar_nome_painel_txt)"
+    saida "  Senha do administrador : TEMPORÁRIA (o banco será trocado pelo do pacote); pedida pelo deploy.sh no terminal (nunca gravada)."
+  else
+    saida "  Senha do administrador : será pedida pelo deploy.sh, digitada no terminal (nunca gravada)."
+  fi
+}
+
+importar_nome_painel_txt() { # o nome que será passado à ferramenta
+  if [ -n "$IMP_HOST" ]; then printf '%s (--painel-hostname)' "$IMP_HOST"
+  elif [ "$IMP_HOMOL" = 1 ]; then printf '%s:%s (homologação: automático, nunca o nome da origem)' "$R_DOMINIO" "$HTTPS_PORT"
+  else printf 'o do pacote (informado pelo importar --check)'; fi
 }
 
 perguntas_interativas() {
@@ -885,7 +952,7 @@ pre_programas() {
 }
 
 check_precheck() {
-  pre_programas; pre_so; pre_ufw; pre_relogio; pre_memoria; pre_espaco; pre_rede
+  pre_programas; pre_so; pre_ufw; pre_relogio; pre_memoria; pre_espaco; pre_rede; pre_importar
 }
 
 etapa_precheck_run() {
@@ -899,6 +966,7 @@ etapa_precheck_run() {
     pergunta "Ubuntu 22.04 não é o alvo oficial. Continuar mesmo assim? (digite sim)" || die "entrada encerrada."
     [ "$RESP" = "sim" ] || die "instalação cancelada (Ubuntu 22.04 não confirmado)."
   fi
+  importar_confirma_sha
 }
 
 # =============================================================================
@@ -1325,6 +1393,55 @@ codigo_commit() {
   git_ -C "$NB_DIR" log -1 --format='%h %ad %s' --date=short 2>/dev/null
 }
 
+# Compara o clone existente com origin/$BRANCH. Define CODIGO_LOCAL, CODIGO_REMOTO e CODIGO_REL:
+#   em-dia | atras (fast-forward possível) | adiantado | divergente | diferente (só "consulta") | desconhecido
+# "fetch" (etapa) grava objetos no .git do root; "consulta" (--check) só usa ls-remote e não escreve nada.
+CODIGO_LOCAL=""; CODIGO_REMOTO=""; CODIGO_REL=""
+codigo_compara() { # $1 = fetch | consulta
+  CODIGO_REL="desconhecido"; CODIGO_REMOTO=""
+  CODIGO_LOCAL="$(git_ -C "$NB_DIR" rev-parse HEAD 2>/dev/null </dev/null | head -n 1)"
+  if [ "$1" = fetch ]; then
+    GIT_SSH_COMMAND="$(git_ssh_cmd)" git_ -C "$NB_DIR" fetch origin "$BRANCH" >/dev/null 2>&1 </dev/null || return 0
+    CODIGO_REMOTO="$(git_ -C "$NB_DIR" rev-parse 'FETCH_HEAD^{commit}' 2>/dev/null </dev/null | head -n 1)"
+  else
+    CODIGO_REMOTO="$(GIT_SSH_COMMAND="$(git_ssh_cmd)" git_ -C "$NB_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null </dev/null | awk 'NR == 1 {print $1}')"
+  fi
+  [[ $CODIGO_LOCAL =~ ^[0-9a-f]{7,64}$ ]] && [[ $CODIGO_REMOTO =~ ^[0-9a-f]{7,64}$ ]] || return 0
+  if [ "$CODIGO_LOCAL" = "$CODIGO_REMOTO" ]; then CODIGO_REL="em-dia"
+  elif ! git_ -C "$NB_DIR" cat-file -e "$CODIGO_REMOTO^{commit}" 2>/dev/null; then CODIGO_REL="diferente"
+  elif git_ -C "$NB_DIR" merge-base --is-ancestor "$CODIGO_LOCAL" "$CODIGO_REMOTO" 2>/dev/null; then CODIGO_REL="atras"
+  elif git_ -C "$NB_DIR" merge-base --is-ancestor "$CODIGO_REMOTO" "$CODIGO_LOCAL" 2>/dev/null; then CODIGO_REL="adiantado"
+  else CODIGO_REL="divergente"; fi
+}
+
+codigo_sincroniza() { # etapa: clone existente em dia com origin/$BRANCH (ou atualiza por fast-forward)
+  local l r sujo
+  saida "Conferindo se o código local está em dia com origin/$BRANCH..."
+  codigo_compara fetch
+  l="${CODIGO_LOCAL:0:7}"; r="${CODIGO_REMOTO:0:7}"
+  case "$CODIGO_REL" in
+    em-dia) saida "ok: código em dia (local $l = remoto $r)." ;;
+    adiantado) aviso_msg "o código local ($l) está À FRENTE de origin/$BRANCH ($r); seguindo com o código local." ;;
+    desconhecido) aviso_msg "não foi possível comparar com origin/$BRANCH (fetch falhou ou resposta ilegível); seguindo com o código local. Se a configuração reclamar de arquivo ausente, o código pode estar desatualizado." ;;
+    atras)
+      saida "código DESATUALIZADO: local $l, remoto $r."
+      sujo="$(git_ -C "$NB_DIR" status --porcelain --untracked-files=no 2>/dev/null </dev/null | head -n 5)"
+      if [ -n "$sujo" ]; then
+        die "o código em $NB_DIR tem alterações locais em arquivos versionados (não dá para atualizar sozinho):
+$sujo
+Guarde-as (git -C $NB_DIR stash) ou descarte-as (git -C $NB_DIR checkout -- .) e rode o instalador de novo. Nada foi alterado além do fetch."
+      fi
+      pergunta "Atualizar para $r? [S/n]" || die "entrada encerrada. Nada foi alterado além do fetch."
+      case "${RESP,,}" in
+        n|nao|não) die "código desatualizado (local $l, remoto $r) e a atualização foi recusada; a configuração precisa do código atual. Nada foi alterado além do fetch." ;;
+      esac
+      executa "$CMD_GIT" -C "$NB_DIR" merge --ff-only FETCH_HEAD || die "o merge --ff-only falhou; confira: git -C $NB_DIR status."
+      saida "ok: código atualizado para $(codigo_commit)." ;;
+    *)
+      die "o código local ($l) e origin/$BRANCH ($r) DIVERGIRAM (não há fast-forward). Resolva à mão (git -C $NB_DIR log --oneline --graph --all; git -C $NB_DIR status) ou renomeie $NB_DIR para o instalador clonar de novo, e rode-o outra vez. Nada foi alterado além do fetch." ;;
+  esac
+}
+
 check_codigo() {
   deploy_estado
   case "$DEPLOY_ESTADO" in
@@ -1336,7 +1453,18 @@ check_codigo() {
   codigo_estado
   case "$CODIGO_ESTADO" in
     ausente) item falta "código do produto ausente ($NB_DIR)" ;;
-    ok) item ok "código do produto em $NB_DIR: $(codigo_commit)" ;;
+    ok)
+      item ok "código do produto em $NB_DIR: $(codigo_commit)"
+      if [ "$CHECK_REMOTE" = 1 ]; then
+        codigo_compara consulta
+        case "$CODIGO_REL" in
+          em-dia) item ok "código em dia com origin/$BRANCH (${CODIGO_REMOTO:0:7})" ;;
+          adiantado) item aviso "código local (${CODIGO_LOCAL:0:7}) à frente de origin/$BRANCH (${CODIGO_REMOTO:0:7})" ;;
+          atras|diferente) item falta "código DESATUALIZADO: local ${CODIGO_LOCAL:0:7}, remoto ${CODIGO_REMOTO:0:7}; a instalação oferece atualizar (fast-forward) antes da configuração" ;;
+          divergente) item falta "código local (${CODIGO_LOCAL:0:7}) DIVERGE de origin/$BRANCH (${CODIGO_REMOTO:0:7}); resolva à mão" ;;
+          *) item aviso "não foi possível comparar o código com origin/$BRANCH" ;;
+        esac
+      fi ;;
     *) item falta "$CODIGO_MOTIVO" ;;
   esac
 }
@@ -1354,7 +1482,7 @@ etapa_codigo_run() {
   codigo_estado
   case "$CODIGO_ESTADO" in
     outro) die "$CODIGO_MOTIVO. Nada foi alterado." ;;
-    ok) saida "ok: $NB_DIR já é o repositório do produto; segue (sem atualizar nesta fase)." ;;
+    ok) saida "ok: $NB_DIR já é o repositório do produto."; codigo_sincroniza ;;
     ausente)
       livre="$(espaco_livre_mb)"
       if [ -z "$livre" ] || [ "$livre" -lt "$DISK_MIN_MB" ]; then
@@ -1669,6 +1797,10 @@ deploy_aviso_senha() {
   saida " (usuário admin): 12 ou mais caracteres, 3 dos 4 tipos (minúsculas,"
   saida " maiúsculas, números, símbolos). Digite e tecle Enter; depois repita."
   saida " Ela não aparece na tela e não é gravada."
+  if [ "$IMP_ATIVO" = 1 ]; then
+    saida " ATENÇÃO (--importar): esta senha é TEMPORÁRIA. O banco será trocado pelo do pacote"
+    saida " e os logins passarão a ser os do servidor de origem."
+  fi
   saida "=================================================================="
   saida ""
 }
@@ -1774,6 +1906,502 @@ check_deploy() {
     criado|existente) item ok "administrador do painel: $(estado_get ADMIN)" ;;
     *) item aviso "administrador do painel ainda não criado (veja o relatório)" ;;
   esac
+}
+
+# =============================================================================
+# ETAPA IMPORTAR - instala já com os dados de outro servidor (recuperação/migração)
+# =============================================================================
+# Regras:
+#   - o root só LÊ o arquivo de origem; a cópia é gravada pelo PRÓPRIO netbackup
+#     (sudo -u netbackup install/tee/rm/sha256sum) em $IMPORT_DIR (700, arquivos 600);
+#   - a ferramenta do produto roda SEMPRE como netbackup, a partir de $NB_DIR; o root não
+#     executa nem lê com "source" nada que o netbackup possa escrever;
+#   - a senha do pacote é pedida no terminal, fica só numa variável do shell e vai à ferramenta
+#     pelo descritor 3 (--senha-fd 3) de um pipe alimentado por builtin (nunca em argv, disco ou log);
+#   - o importar real só roda depois de um "importar --check" com saída 0 sobre o MESMO arquivo.
+readonly IMP_NOME_RE='^netbackup[A-Za-z0-9._-]*-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])_([01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]-(sistema|completo)(-[0-9]+)?\.tar\.gz(\.gpg)?$'
+CHECKLIST_ARQ="${CHECKLIST_ARQ:-$ESTADO_DIR/importacao-checklist.txt}"
+IMP_TENTATIVAS_SENHA=3
+
+como_app() { "$CMD_SUDO" -u "$APP_USER" -- "$@"; }
+
+# Texto vindo da ferramenta (rodou como netbackup) é tratado como NÃO confiável: sem caracteres de controle.
+limpa_saida() { tr -d '\000-\010\013-\037\177'; }
+
+# Valor seguro para o registro de estado (só os caracteres que ele aceita).
+estado_seguro() {
+  if [[ $1 =~ ^[A-Za-z0-9._:@/+\ -]*$ ]] && [ -n "$1" ]; then printf '%s' "$1"; else printf 'n/d'; fi
+}
+
+# Junta linha de comando e arquivo de respostas (a linha de comando vale mais). Termina com erro (2) se inconsistente.
+importar_resolve() {
+  local arq="$CLI_IMP_ARQ" homol="$CLI_IMP_HOMOL" host="$CLI_IMP_HOST"
+  IMP_ATIVO=0; IMP_ARQ=""; IMP_HOMOL=0; IMP_HOST=""
+  if [ -n "$RESPOSTAS_ARQ" ] && carrega_respostas_arquivo "$RESPOSTAS_ARQ" quieto; then
+    [ -n "$arq" ] || arq="$R_IMP_ARQ"
+    [ "$homol" = 1 ] || homol="${R_IMP_HOMOL:-0}"
+    [ -n "$host" ] || host="$R_IMP_HOST"
+    if [ -n "$CLI_IMP_ARQ" ] && [ -n "$R_IMP_ARQ" ] && [ "$CLI_IMP_ARQ" != "$R_IMP_ARQ" ]; then
+      printf 'AVISO: --importar (%s) e IMPORTAR_ARQUIVO (%s) diferem; vale a linha de comando.\n' "$CLI_IMP_ARQ" "$R_IMP_ARQ"
+    fi
+  fi
+  resp_limpa
+  if [ -z "$arq" ]; then
+    if [ "$homol" = 1 ] || [ -n "$host" ] || [ "$IMP_FORCAR" = 1 ] || [ "$IMP_SEM_SHA" = 1 ]; then
+      printf 'ERRO: --homologacao, --painel-hostname, --forcar-importacao, --sem-sha256 e as chaves IMPORTAR_* só valem com --importar ARQUIVO (ou IMPORTAR_ARQUIVO nas respostas).\n' >&2
+      exit 2
+    fi
+    return 0
+  fi
+  case "$arq" in /*) ;; *) arq="$PWD/$arq" ;; esac
+  IMP_ATIVO=1; IMP_ARQ="$arq"; IMP_HOMOL="$homol"; IMP_HOST="$host"
+  IMP_NOME="$(basename -- "$arq")"
+  IMP_DEST="$IMPORT_DIR/$IMP_NOME"
+  return 0
+}
+
+# ---- 1) validação do arquivo (SÓ LEITURA; usada pelo precheck e pelo --check) -----------------
+pre_importar() {
+  local shaf dir nome h f linhas
+  [ "$IMP_ATIVO" = 1 ] || return 0
+  IMP_SHA_STATUS=""; IMP_SHA_ESPERADO=""
+  nome="$IMP_NOME"
+  shaf="$IMP_ARQ.sha256"
+  if [ -L "$IMP_ARQ" ]; then item falta "pacote: $IMP_ARQ é um link simbólico (use o arquivo de verdade)"; return 0; fi
+  if [ ! -e "$IMP_ARQ" ]; then item falta "pacote: arquivo não existe: $IMP_ARQ"; return 0; fi
+  if [ ! -f "$IMP_ARQ" ]; then item falta "pacote: $IMP_ARQ não é um arquivo comum"; return 0; fi
+  if [ ! -r "$IMP_ARQ" ]; then item falta "pacote: $IMP_ARQ não é legível pelo root"; return 0; fi
+  if [ ! -s "$IMP_ARQ" ]; then item falta "pacote: $IMP_ARQ está vazio"; return 0; fi
+  if ! [[ $nome =~ $IMP_NOME_RE ]]; then
+    item falta "pacote: nome '$nome' fora do padrão do produto (netbackup...-AAAAMMDD_HHMMSS-(sistema|completo)[-N].tar.gz[.gpg])"
+    return 0
+  fi
+  item ok "pacote: $IMP_ARQ ($("$CMD_STAT" -c '%s' -- "$IMP_ARQ" 2>/dev/null || echo '?') bytes; arquivo comum, legível)"
+  if [ -L "$shaf" ]; then
+    item falta "pacote: $shaf é um link simbólico"; IMP_SHA_STATUS="falha"
+  elif [ -f "$shaf" ]; then
+    linhas="$(grep -c . -- "$shaf" 2>/dev/null)"
+    read -r h f <"$shaf" 2>/dev/null
+    f="${f#\*}"
+    h="${h,,}"
+    if [ "${linhas:-0}" != 1 ] || ! [[ $h =~ ^[0-9a-f]{64}$ ]] || [ "$f" != "$nome" ]; then
+      item falta "pacote: $shaf inválido (esperado: uma linha 'HASH  $nome')"; IMP_SHA_STATUS="falha"
+    elif ( cd -- "$(dirname -- "$IMP_ARQ")" && "$CMD_SHA256" -c --status -- "$(basename -- "$shaf")" ) 2>/dev/null; then
+      item ok "pacote: sha256 confere com $shaf"; IMP_SHA_STATUS="ok"; IMP_SHA_ESPERADO="$h"
+    else
+      item falta "pacote: o sha256 NÃO confere com $shaf (arquivo corrompido ou adulterado)"; IMP_SHA_STATUS="falha"
+    fi
+  else
+    IMP_SHA_STATUS="ausente"
+    if [ "$IMP_SEM_SHA" = 1 ]; then item aviso "pacote: sem $shaf; seguindo por causa de --sem-sha256 (integridade do arquivo NÃO conferida)"
+    else item aviso "pacote: sem $shaf; na instalação será pedida confirmação explícita (ou use --sem-sha256)"; fi
+  fi
+  case "$nome" in
+    *.gpg) if command -v -- "$CMD_GPG" >/dev/null 2>&1; then item ok "gpg presente (pacote cifrado)"
+           else item falta "programa '$CMD_GPG' ausente (instale o pacote: gnupg); o pacote é cifrado"; fi ;;
+  esac
+  if command -v -- "$CMD_SUDO" >/dev/null 2>&1; then item ok "sudo presente (a ferramenta do produto roda como $APP_USER)"
+  else item falta "programa '$CMD_SUDO' ausente (instale o pacote: sudo)"; fi
+  item aviso "a senha do pacote será pedida no terminal durante a instalação (este modo não a pede nem roda a ferramenta do produto)"
+  if [ "$IMP_HOMOL" = 1 ]; then
+    item aviso "modo HOMOLOGAÇÃO: os agendamentos ficarão desligados depois da importação"
+    if [ -z "$IMP_HOST" ]; then item aviso "homologação sem --painel-hostname: será passado <domínio das respostas>:$HTTPS_PORT (nunca o nome da origem)"; fi
+  fi
+  if [ -n "$IMP_HOST" ]; then item ok "nome do painel pedido para o destino: $IMP_HOST"; fi
+}
+
+# Sem .sha256: pede confirmação explícita (antes de qualquer alteração).
+importar_confirma_sha() {
+  [ "$IMP_ATIVO" = 1 ] || return 0
+  [ "$IMP_SHA_STATUS" = ausente ] || return 0
+  [ "$IMP_SEM_SHA" = 1 ] && return 0
+  [ "$IMP_SHA_CONFIRMADO" = 1 ] && return 0
+  aviso_msg "não há $IMP_ARQ.sha256: sem ele não dá para provar que o pacote chegou íntegro e é o que foi exportado."
+  pergunta "Importar mesmo assim, sem conferir o sha256? (digite sim)" || die "entrada encerrada. Nada foi alterado."
+  [ "$RESP" = "sim" ] || die "importação cancelada: sem o .sha256 e sem confirmação. Nada foi alterado (copie o .sha256 para junto do pacote ou use --sem-sha256)."
+  IMP_SHA_CONFIRMADO=1
+}
+
+# ---- 2) destino com dados ------------------------------------------------------------------
+IMP_DADOS_MOTIVO=""
+importar_destino_tem_dados() { # 0 = o produto parece já ter dados (não é instalação nova)
+  IMP_DADOS_MOTIVO=""
+  deploy_estado
+  if [ "$DEPLOY_ESTADO" = detectado ] || [ "$(estado_get DEPLOY_ORIGEM)" = detectado ]; then
+    IMP_DADOS_MOTIVO="o produto já estava instalado (deploy não feito por este instalador): pode ter equipamentos e backups"
+    return 0
+  fi
+  if [ "$(estado_get ADMIN)" = existente ]; then
+    IMP_DADOS_MOTIVO="o banco já tinha usuários antes do deploy (não é instalação nova)"
+    return 0
+  fi
+  if [ -d "$BACKUPS_DIR" ] && [ -n "$(find -P "$BACKUPS_DIR" -mindepth 1 -type f -print -quit 2>/dev/null)" ]; then
+    IMP_DADOS_MOTIVO="há arquivos de backup em $BACKUPS_DIR"
+    return 0
+  fi
+  return 1
+}
+
+# ---- 3) transporte: o netbackup grava; o root só lê -------------------------------------------
+importar_transporta() {
+  local h_src h_dst rcs st
+  como_app install -d -m 700 -- "$IMPORT_DIR" || die "não foi possível criar $IMPORT_DIR como usuário $APP_USER (o usuário e a pasta pessoal existem depois do deploy?)."
+  st="$(como_app stat -c '%U %a' -- "$IMPORT_DIR" 2>/dev/null)"
+  if [ "$st" != "$APP_USER 700" ] || como_app test -L "$IMPORT_DIR"; then
+    die "$IMPORT_DIR deveria ser uma pasta do usuário $APP_USER com modo 700 (encontrado: '${st:-?}'); nada foi copiado."
+  fi
+  saida "calculando o sha256 do pacote..."
+  h_src="$("$CMD_SHA256" -- "$IMP_ARQ" 2>/dev/null | awk '{print tolower($1)}')"
+  [[ $h_src =~ ^[0-9a-f]{64}$ ]] || die "não foi possível calcular o sha256 de $IMP_ARQ."
+  if [ -n "$IMP_SHA_ESPERADO" ] && [ "$h_src" != "$IMP_SHA_ESPERADO" ]; then
+    die "o arquivo mudou depois da conferência do .sha256 ($IMP_ARQ); nada foi copiado."
+  fi
+  saida "copiando o pacote para $IMPORT_DIR (gravado pelo usuário $APP_USER; o root só lê o original)..."
+  # shellcheck disable=SC2016  # o script de sh -c é de propósito literal ($1 é expandido pelo sh do netbackup)
+  cat -- "$IMP_ARQ" | como_app sh -c 'umask 077; exec tee -- "$1" >/dev/null' sh "$IMP_DEST"
+  rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[0]}" != 0 ] || [ "${rcs[1]}" != 0 ]; then
+    como_app rm -f -- "$IMP_DEST" 2>/dev/null
+    die "a cópia do pacote falhou (leitura=${rcs[0]}, gravação=${rcs[1]}); a cópia parcial foi removida."
+  fi
+  como_app chmod 600 -- "$IMP_DEST" || die "não foi possível ajustar o modo de $IMP_DEST."
+  h_dst="$(como_app "$CMD_SHA256" -- "$IMP_DEST" 2>/dev/null | awk '{print tolower($1)}')"
+  if [ "$h_dst" != "$h_src" ]; then
+    como_app rm -f -- "$IMP_DEST" 2>/dev/null
+    die "a cópia em $IMP_DEST não confere com o original (sha256 diferente); a cópia foi removida."
+  fi
+  saida "ok: cópia conferida (sha256 igual ao do original) em $IMP_DEST (modo 600, dono $APP_USER)."
+}
+
+# ---- 4) ferramenta do produto (SEMPRE como netbackup, a partir de $NB_DIR) -------------------
+# $@ = argumentos de "tools.pacote"; a senha vai pelo descritor 3 (primeira linha), de um pipe de builtin.
+pacote_roda() {
+  printf '%s\n' "$SENHA_PACOTE" | ( cd -- "$NB_DIR" 2>/dev/null && "$CMD_SUDO" -u "$APP_USER" -- \
+    sh -c 'exec venv/bin/python -m tools.pacote "$@" 3<&0' sh "$@" --senha-fd 3 )
+}
+
+manutencao() { # $@ = argumentos de "tools.manutencao" (sem senha)
+  ( cd -- "$NB_DIR" 2>/dev/null && "$CMD_SUDO" -u "$APP_USER" -- venv/bin/python -m tools.manutencao "$@" )
+}
+
+importar_args_extra() { # imprime os argumentos opcionais, um por linha
+  if [ "$IMP_HOMOL" = 1 ]; then printf '%s\n' --homologacao; fi
+  if [ -n "$IMP_HOST" ]; then printf '%s\n' --painel-hostname "$IMP_HOST"; fi
+}
+
+importar_pede_senha() {
+  SENHA_PACOTE=""
+  printf 'Senha do pacote (não aparece na tela e não é gravada em lugar nenhum): '
+  registra "PERGUNTA: senha do pacote (o valor nunca é registrado)"
+  if ! IFS= read -rs SENHA_PACOTE; then SENHA_PACOTE=""; printf '\n'; registra "RESPOSTA: (fim da entrada)"; return 2; fi
+  printf '\n'
+  [ -n "$SENHA_PACOTE" ]
+}
+
+# Mensagem própria para cada código de saída da ferramenta (1 a 7). $1 = código ; $2 = "check"|"real"
+importar_msg_rc() {
+  case "$1" in
+    1) echo "erro de entrada/saída na ferramenta do produto (disco cheio, permissão ou arquivo ilegível para o usuário $APP_USER)." ;;
+    2) echo "importação RECUSADA pela ferramenta (uso incorreto, senha curta, manutenção desligada, serviço ativo ou outra importação em andamento)." ;;
+    3) echo "pacote INVÁLIDO ou ADULTERADO: não use este arquivo; gere/copie o pacote de novo na origem." ;;
+    4) echo "senha do pacote INCORRETA." ;;
+    5) echo "o pacote é MAIS NOVO que o código do produto instalado: atualize o produto (código e deploy) e rode o instalador de novo." ;;
+    6) echo "gpg ausente: instale o pacote gnupg (apt-get install gnupg) e rode o instalador de novo." ;;
+    7) echo "a importação PAROU NO MEIO." ;;
+    *) echo "código de saída inesperado ($1) da ferramenta do produto." ;;
+  esac
+}
+
+# Procura "PANEL_HOSTNAME: origem X → destino Y" na saída do --check. Formatos reais:
+#   "... → destino Y"                                                    (com --painel-hostname)
+#   "... → destino X (o pacote o traz; para trocar use --painel-hostname NOME[:PORTA])"   (sem)
+# Só o PRIMEIRO token depois de "destino " vale (o resto é ignorado); "(não definido)" = sem nome.
+importar_le_hostname() { # $1 = saída ; define IMP_ORIGEM e IMP_DOM_EFETIVO
+  local linha re='PANEL_HOSTNAME: origem (.*) (→|->) destino (.*)$' y nome
+  IMP_ORIGEM=""; IMP_DOM_EFETIVO=""
+  while IFS= read -r linha; do
+    if [[ $linha =~ $re ]]; then
+      IMP_ORIGEM="$(trim "${BASH_REMATCH[1]}")"
+      case "$IMP_ORIGEM" in "("*) IMP_ORIGEM="" ;; esac
+      y="$(trim "${BASH_REMATCH[3]}")"
+      y="${y%%[[:space:]]*}"
+      y="${y,,}"
+      nome="${y%%:*}"
+      if [[ $y != "("* ]] && dominio_valido "$nome"; then IMP_DOM_EFETIVO="$nome"; fi
+      break
+    fi
+  done <<<"$1"
+  if [ -n "$IMP_HOST" ]; then
+    nome="${IMP_HOST%%:*}"
+    if [ -n "$IMP_DOM_EFETIVO" ] && [ "$IMP_DOM_EFETIVO" != "$nome" ]; then
+      aviso_msg "a ferramenta informou o destino '$IMP_DOM_EFETIVO', mas o nome pedido foi '$nome'; vale o pedido ($nome)."
+    fi
+    IMP_DOM_EFETIVO="$nome"
+  elif [ -z "$IMP_DOM_EFETIVO" ]; then
+    aviso_msg "não foi possível ler o nome do painel do pacote na saída da ferramenta; o HTTPS manterá o nome das respostas (${R_DOMINIO:-?})."
+  fi
+}
+
+importar_check_ferramenta() { # roda "importar --check" (até 3 senhas); define IMP_ORIGEM/IMP_DOM_EFETIVO
+  local t=0 out rc extra=() l pre
+  while IFS= read -r l; do [ -n "$l" ] && extra+=("$l"); done < <(importar_args_extra)
+  saida "Conferindo o pacote com a ferramenta do produto (importar --check)..."
+  while [ "$t" -lt "$IMP_TENTATIVAS_SENHA" ]; do
+    t=$((t + 1))
+    importar_pede_senha; rc=$?
+    if [ "$rc" = 2 ]; then die "entrada encerrada antes da senha do pacote. Nenhum serviço foi parado; a cópia do pacote continua em $IMP_DEST."; fi
+    if [ "$rc" != 0 ]; then
+      SENHA_PACOTE=""
+      aviso_msg "a senha não pode ser vazia."
+      continue
+    fi
+    out="$(pacote_roda importar "$IMP_DEST" --check "${extra[@]}" 2>&1 | limpa_saida; exit "${PIPESTATUS[0]}")"; rc=$?
+    [ -z "$out" ] || saida "$out"
+    case "$rc" in
+      0)
+        if printf '%s\n' "$out" | grep -qi 'tem dados' && printf '%s\n' "$out" | grep -q '(1 usuário' \
+           && [ "$(estado_get ADMIN)" = criado ] && [ "$(estado_get DEPLOY_ORIGEM)" != detectado ] && [ "$(estado_get DEPLOY_FEITO)" = 1 ]; then
+          saida "(esperado: é o admin temporário criado pelo deploy agora há pouco)"
+        fi
+        pre="$(printf '%s\n' "$out" | grep -E 'pré-condições para importar:' | tail -n 1)"
+        if [ -z "$pre" ]; then aviso_msg "a ferramenta não informou a linha 'pré-condições para importar'."
+        else case "$pre" in
+          *PENDENTE*) saida "(pendências de pré-condição são esperadas agora: o instalador para os serviços e liga a manutenção a seguir.)" ;;
+        esac; fi
+        importar_le_hostname "$out"
+        saida "ok: importar --check terminou com 0."
+        return 0 ;;
+      4) SENHA_PACOTE=""
+         aviso_msg "senha incorreta (tentativa $t de $IMP_TENTATIVAS_SENHA)." ;;
+      2) if printf '%s' "$out" | grep -qi 'curta'; then
+           SENHA_PACOTE=""; aviso_msg "senha curta demais (tentativa $t de $IMP_TENTATIVAS_SENHA)."
+         else
+           SENHA_PACOTE=""
+           die "$(importar_msg_rc 2) A cópia do pacote continua em $IMP_DEST. Nenhum serviço foi parado."
+         fi ;;
+      *) SENHA_PACOTE=""
+         die "$(importar_msg_rc "$rc") A cópia do pacote continua em $IMP_DEST. Nenhum serviço foi parado." ;;
+    esac
+  done
+  SENHA_PACOTE=""
+  die "senha do pacote não aceita após $IMP_TENTATIVAS_SENHA tentativas. A cópia do pacote continua em $IMP_DEST. Nenhum serviço foi parado."
+}
+
+importar_servicos_ativos() { # 0 = algum dos dois serviços está ativo
+  local s
+  for s in "${SERVICOS_APP[@]}"; do
+    if "$CMD_SYSTEMCTL" is-active --quiet "$s" >/dev/null 2>&1; then return 0; fi
+  done
+  return 1
+}
+
+importar_sobe_servicos() {
+  local s ok=0
+  "$CMD_SYSTEMCTL" start "${SERVICOS_APP[@]}" >/dev/null 2>&1 || ok=1
+  for s in "${SERVICOS_APP[@]}"; do
+    if ! "$CMD_SYSTEMCTL" is-active --quiet "$s" >/dev/null 2>&1; then ok=1; erro "o serviço $s não está ativo."; fi
+  done
+  return "$ok"
+}
+
+importar_nome_difere() { # $1 = nome efetivo -> aviso quando difere do das respostas
+  [ -n "$1" ] && [ -n "$R_DOMINIO" ] && [ "$1" != "$R_DOMINIO" ] || return 1
+  aviso_msg "O nome do painel do pacote ($1) é DIFERENTE do nome das respostas ($R_DOMINIO). O HTTPS usará '$1': o DNS de $1 precisa apontar para esta VM (senão o HTTPS fica provisório)."
+}
+
+importar_checklist_guarda() { # $1 = saída da ferramenta
+  local chk
+  chk="$(printf '%s\n' "$1" | awk '/CHECKLIST DO DESTINO/ {f = 1; next} f && /^[[:space:]]*\[ \]/ {print}')"
+  if [ -n "$chk" ]; then
+    printf '%s\n' "$chk" | escreve_arq "$CHECKLIST_ARQ" 600 || aviso_msg "não foi possível gravar $CHECKLIST_ARQ."
+  else
+    rm -f -- "$CHECKLIST_ARQ"
+    aviso_msg "a ferramenta não imprimiu o 'CHECKLIST DO DESTINO'; consulte a saída acima."
+  fi
+}
+
+importar_limpeza() { # pergunta se apaga a cópia (padrão: apagar)
+  local apagar=1
+  saida ""
+  if pergunta "Apagar a cópia do pacote em $IMP_DEST? [S/n]"; then
+    case "${RESP,,}" in n|nao|não) apagar=0 ;; esac
+  else
+    saida "(sem resposta: usando o padrão, apagar.)"
+  fi
+  if [ "$apagar" = 1 ]; then
+    como_app rm -f -- "$IMP_DEST" || aviso_msg "não foi possível apagar $IMP_DEST."
+    como_app rmdir -- "$IMPORT_DIR" 2>/dev/null
+    saida "cópia do pacote apagada."
+    estado_set IMPORT_COPIA apagada
+  else
+    saida "a cópia do pacote foi MANTIDA em $IMP_DEST (dono $APP_USER, modo 600); apague-a quando não precisar mais."
+    estado_set IMPORT_COPIA mantida
+  fi
+}
+
+etapa_importar_run() {
+  local st out rc manut_antes extra=() l
+  saida "== 8. Importação do pacote do sistema =="
+  st="$(estado_get IMPORT_STATUS)"
+  if [ "$IMP_ATIVO" != 1 ]; then
+    case "$st" in
+      iniciada|parou) aviso_msg "uma importação anterior ($(estado_get IMPORT_ARQUIVO)) NÃO terminou; os serviços podem estar parados e a manutenção ligada. Veja $PRE_IMPORT_DIR/." ;;
+      *) saida "ok: importação não solicitada (use --importar ARQUIVO para instalar já com os dados de outro servidor)." ;;
+    esac
+    return 0
+  fi
+  if [ "$st" = feita ]; then
+    saida "ok: a importação já foi feita ($(estado_get IMPORT_ARQUIVO)); não será repetida."
+    if [ "$(estado_get IMPORT_ARQUIVO)" != "$IMP_NOME" ]; then
+      aviso_msg "o pacote pedido agora ($IMP_NOME) é diferente do já importado; ele foi IGNORADO."
+    fi
+    return 0
+  fi
+  case "$st" in
+    iniciada|parou)
+      die "uma importação anterior ($(estado_get IMPORT_ARQUIVO)) começou e não terminou. O estado anterior está em $PRE_IMPORT_DIR/ e a manutenção pode estar ligada. Resolva à mão (ou restaure) e rode o instalador SEM --importar para continuar as demais etapas." ;;
+  esac
+  deploy_estado
+  case "$DEPLOY_ESTADO" in feito|detectado) ;; *) die "a importação vem depois do deploy; o deploy ainda não foi feito." ;; esac
+  [ -d "$NB_DIR/venv" ] || die "não há $NB_DIR/venv; a ferramenta do produto não pode rodar."
+
+  if importar_destino_tem_dados; then
+    if [ "$IMP_FORCAR" != 1 ]; then
+      die "RECUSADO: o destino já tem dados ($IMP_DADOS_MOTIVO). Importar SOBREPÕE o banco e os dados atuais. Se é isso mesmo que você quer, rode de novo com --forcar-importacao (o estado anterior fica em $PRE_IMPORT_DIR/). Nada foi alterado."
+    fi
+    saida ""
+    saida "=================================================================="
+    saida " ATENÇÃO: --forcar-importacao. O destino JÁ TEM DADOS ($IMP_DADOS_MOTIVO)."
+    saida " A importação vai SOBREPOR o banco e os dados atuais pelos do pacote."
+    saida " O estado anterior fica em $PRE_IMPORT_DIR/."
+    saida "=================================================================="
+    pergunta "Confirma que quer SOBREPOR os dados atuais? (digite sim)" || die "entrada encerrada. Nada foi alterado."
+    [ "$RESP" = "sim" ] || die "importação cancelada na confirmação. Nada foi alterado."
+  fi
+
+  if [ "$IMP_HOMOL" = 1 ] && [ -z "$IMP_HOST" ]; then
+    IMP_HOST="$R_DOMINIO:$HTTPS_PORT"; IMP_HOST_AUTO=1
+    saida "HOMOLOGAÇÃO: o instalador passa --painel-hostname $IMP_HOST à ferramenta (no --check e na importação) e NÃO assume o nome da origem:"
+    saida "  a cópia roda ao lado da produção; com o nome dela o certificado e o app_settings quebrariam."
+  fi
+  zera_itens; QUIET_ITEMS=1; pre_importar; QUIET_ITEMS=0
+  if [ "$N_FALTA" -gt 0 ]; then
+    zera_itens; pre_importar
+    die "o pacote não passou na conferência. Nada foi alterado."
+  fi
+  importar_confirma_sha   # já confirmado no precheck: não pergunta de novo
+
+  importar_transporta
+  importar_check_ferramenta
+  importar_nome_difere "$IMP_DOM_EFETIVO" || true
+  while IFS= read -r l; do [ -n "$l" ] && extra+=("$l"); done < <(importar_args_extra)
+
+  # --- a partir daqui há alteração do sistema ---
+  estado_set IMPORT_STATUS iniciada
+  estado_set IMPORT_ARQUIVO "$IMP_NOME"
+  saida "Parando os serviços do produto: ${SERVICOS_APP[*]}"
+  "$CMD_SYSTEMCTL" stop "${SERVICOS_APP[@]}" >/dev/null 2>&1
+  if importar_servicos_ativos; then
+    estado_set IMPORT_STATUS recusada
+    SENHA_PACOTE=""
+    die "não foi possível parar os serviços (${SERVICOS_APP[*]}); a importação NÃO foi feita. A cópia do pacote continua em $IMP_DEST."
+  fi
+  manutencao estado >/dev/null 2>&1; manut_antes=$?
+  if [ "$manut_antes" != 10 ]; then
+    saida "Ligando a manutenção do produto..."
+    if ! manutencao ligar --motivo "Importacao de pacote do sistema pelo instalador ($IMP_NOME)" >/dev/null 2>&1; then
+      importar_sobe_servicos || true
+      estado_set IMPORT_STATUS recusada
+      SENHA_PACOTE=""
+      die "não foi possível ligar a manutenção; os serviços foram religados e a importação NÃO foi feita. A cópia do pacote continua em $IMP_DEST."
+    fi
+  fi
+  saida "Importando o pacote (pode demorar; a senha é a mesma já informada)..."
+  out="$(pacote_roda importar "$IMP_DEST" "${extra[@]}" 2>&1 | limpa_saida; exit "${PIPESTATUS[0]}")"; rc=$?
+  SENHA_PACOTE=""
+  [ -z "$out" ] || saida "$out"
+  case "$rc" in
+    0) ;;
+    7)
+      estado_set IMPORT_STATUS parou
+      RC_FINAL=1
+      erro "$(importar_msg_rc 7)"
+      erro "O estado ANTERIOR do produto está em $PRE_IMPORT_DIR/."
+      erro "Os serviços NÃO foram religados e a manutenção continua LIGADA. A cópia do pacote continua em $IMP_DEST."
+      erro "Confira a saída acima; só depois de resolver, religue os serviços (systemctl start ${SERVICOS_APP[*]}) e libere a manutenção."
+      die "importação interrompida (código 7)." ;;
+    2|3|4|5|6)
+      estado_set IMPORT_STATUS recusada
+      RC_FINAL=1
+      erro "$(importar_msg_rc "$rc")"
+      if [ "$manut_antes" != 10 ]; then manutencao desligar >/dev/null 2>&1 || erro "não foi possível desligar a manutenção; faça-o à mão (veja o relatório)."; fi
+      importar_sobe_servicos || true
+      die "a importação NÃO foi feita; serviços religados e manutenção restaurada. A cópia do pacote continua em $IMP_DEST." ;;
+    *)
+      estado_set IMPORT_STATUS parou
+      RC_FINAL=1
+      erro "$(importar_msg_rc "$rc")"
+      erro "O estado do produto é incerto: os serviços NÃO foram religados e a manutenção continua como estava. Veja $PRE_IMPORT_DIR/ e a saída acima. A cópia do pacote continua em $IMP_DEST."
+      die "importação com falha (código $rc)." ;;
+  esac
+
+  # sucesso: a manutenção CONTINUA LIGADA até o operador liberar
+  importar_checklist_guarda "$out"
+  saida "Religando os serviços do produto (a manutenção continua LIGADA)..."
+  importar_sobe_servicos || { RC_FINAL=1; erro "os serviços não subiram; confira: systemctl status ${SERVICOS_APP[*]}"; }
+  manutencao estado >/dev/null 2>&1; rc=$?
+  if [ "$rc" != 10 ]; then aviso_msg "a manutenção não aparece como ligada (estado $rc); confira com: tools.manutencao estado"; fi
+  estado_set IMPORT_STATUS feita
+  estado_set IMPORT_FEITO 1
+  estado_set IMPORT_DATA "$(date +%Y-%m-%d)"
+  estado_set IMPORT_ARQUIVO "$IMP_NOME"
+  estado_set IMPORT_ORIGEM "$(estado_seguro "$IMP_ORIGEM")"
+  estado_set IMPORT_HOMOLOGACAO "$([ "$IMP_HOMOL" = 1 ] && echo sim || echo nao)"
+  estado_set IMPORT_MANUTENCAO ligada
+  if [ -n "$IMP_DOM_EFETIVO" ] && [ "$IMP_DOM_EFETIVO" != "$R_DOMINIO" ]; then
+    estado_set IMPORT_DOMINIO_RESPOSTAS "$R_DOMINIO"
+    R_DOMINIO="$IMP_DOM_EFETIVO"
+    respostas_grava
+  fi
+  estado_set IMPORT_PAINEL "${IMP_DOM_EFETIVO:-$R_DOMINIO}"
+  estado_set IMPORT_PAINEL_AUTO "$([ "$IMP_HOST_AUTO" = 1 ] && echo sim || echo nao)"
+  saida "ok: importação concluída (origem: ${IMP_ORIGEM:-n/d}; homologação: $([ "$IMP_HOMOL" = 1 ] && echo sim || echo nao)). Nome do painel para o HTTPS: $R_DOMINIO."
+  saida "A MANUTENÇÃO CONTINUA LIGADA até você liberar (veja o relatório)."
+  importar_limpeza
+}
+
+check_importar() {
+  local st manut arq
+  st="$(estado_get IMPORT_STATUS)"
+  arq="$(estado_get IMPORT_ARQUIVO)"
+  case "$st" in
+    feita)
+      item ok "importação feita: $arq (origem: $(estado_get IMPORT_ORIGEM); homologação: $(estado_get IMPORT_HOMOLOGACAO))"
+      if [ "$CHECK_REMOTE" = 1 ] && [ -d "$NB_DIR/venv" ]; then
+        manutencao estado >/dev/null 2>&1; manut=$?
+        case "$manut" in
+          10) item aviso "manutenção do produto LIGADA: libere o agendador (botão 'Liberar agendador' do painel ou: tools.manutencao desligar)" ;;
+          0) item ok "manutenção do produto desligada" ;;
+          *) item aviso "não foi possível ler o estado da manutenção (código $manut)" ;;
+        esac
+      fi
+      return 0 ;;
+    iniciada|parou)
+      item falta "importação de $arq INTERROMPIDA: estado anterior em $PRE_IMPORT_DIR/; serviços e manutenção precisam de conferência manual"
+      return 0 ;;
+  esac
+  if [ "$IMP_ATIVO" != 1 ]; then item ok "importação não solicitada (--importar)"; return 0; fi
+  item aviso "importação de $IMP_NOME solicitada e ainda não executada"
+  if [ -d "$NB_DIR" ]; then
+    deploy_estado
+    case "$DEPLOY_ESTADO" in
+      feito|detectado)
+        if importar_destino_tem_dados; then
+          if [ "$IMP_FORCAR" = 1 ]; then item aviso "destino com dados ($IMP_DADOS_MOTIVO): a importação SOBREPÕE (--forcar-importacao)"
+          else item falta "destino com dados ($IMP_DADOS_MOTIVO): a importação seria recusada sem --forcar-importacao"; fi
+        else item ok "destino sem equipamentos nem backups (instalação nova)"; fi ;;
+    esac
+  fi
 }
 
 # =============================================================================
@@ -2073,7 +2701,7 @@ https_definitivo() { # emite (se preciso) e aplica o site definitivo; 0 = ok
 
 etapa_https_run() {
   local modo
-  saida "== 8. HTTPS (Nginx na porta $HTTPS_PORT) =="
+  saida "== 9. HTTPS (Nginx na porta $HTTPS_PORT) =="
   [ "$R_CARREGADAS" = 1 ] || die "sem respostas carregadas (etapa de perguntas)."
   deploy_estado
   case "$DEPLOY_ESTADO" in
@@ -2211,7 +2839,7 @@ ufw_regra_existe() { # $1 = rede CIDR
 
 etapa_firewall_run() {
   local e net
-  saida "== 9. Firewall (${HTTPS_PORT}/tcp para as redes do painel) =="
+  saida "== 10. Firewall (${HTTPS_PORT}/tcp para as redes do painel) =="
   [ "$R_CARREGADAS" = 1 ] || die "sem respostas carregadas (etapa de perguntas)."
   for e in "${R_PAINEL[@]}"; do
     net=${e%% *}
@@ -2334,6 +2962,7 @@ titulo_etapa() {
     codigo) echo "Código do produto" ;;
     config) echo "Configuração do produto" ;;
     deploy) echo "Deploy do produto (deploy.sh)" ;;
+    importar) echo "Importação do pacote do sistema" ;;
     https) echo "HTTPS (Nginx) na porta $HTTPS_PORT" ;;
     firewall) echo "Firewall (regras da porta $HTTPS_PORT)" ;;
     relatorio) echo "Relatório (deploy.sh --check)" ;;
@@ -2342,8 +2971,59 @@ titulo_etapa() {
 }
 
 # Texto do relatório (stdout). Sem segredos: nada de senha, chave nem e-mail.
+# Seção de importação do relatório (sempre diz sim/não; nunca a senha).
+relatorio_importacao() {
+  local st arq homol dom_orig
+  st="$(estado_get IMPORT_STATUS)"; arq="$(estado_get IMPORT_ARQUIVO)"; homol="$(estado_get IMPORT_HOMOLOGACAO)"
+  printf '\nIMPORTAÇÃO DO PACOTE DO SISTEMA\n'
+  case "$st" in
+    feita)
+      printf '  Importação ..........: sim\n'
+      printf '  Pacote ..............: %s (a senha do pacote não é gravada em lugar nenhum)\n' "$arq"
+      printf '  Origem (painel) .....: %s\n' "$(estado_get IMPORT_ORIGEM)"
+      printf '  Homologação .........: %s\n' "${homol:-nao}"
+      printf '  Nome do painel ......: %s\n' "$(estado_get IMPORT_PAINEL)"
+      dom_orig="$(estado_get IMPORT_DOMINIO_RESPOSTAS)"
+      if [ -n "$dom_orig" ]; then
+        printf '    (diferente do nome das respostas, %s: o HTTPS usa o nome do pacote; o DNS dele precisa apontar para esta VM)\n' "$dom_orig"
+      fi
+      printf '  Cópia do pacote .....: %s\n' "$(case "$(estado_get IMPORT_COPIA)" in mantida) echo "MANTIDA em $IMPORT_DIR (apague quando não precisar mais)" ;; apagada) echo apagada ;; *) echo '(não registrada)' ;; esac)"
+      printf '\n  A MANUTENÇÃO DO PRODUTO CONTINUA LIGADA (situação ao fim da instalação) até você liberar:\n'
+      printf '    - pelo painel: botão "Liberar agendador" da faixa de manutenção; ou\n'
+      printf '    - pelo terminal: cd %s && sudo -u %s venv/bin/python -m tools.manutencao desligar\n' "$NB_DIR" "$APP_USER"
+      printf '    - para consultar: ... -m tools.manutencao estado   (saída 0 = desligada, 10 = ligada)\n'
+      printf '\n  REDES DO PAINEL: as config/trusted_*_networks.conf do produto vieram do PACOTE (são as da origem),\n'
+      printf '  mas o UFW desta VM recebeu as redes das RESPOSTAS. Confira no painel, em Firewall >\n'
+      printf '  "Aplicar regras faltantes".\n'
+      if [ "$homol" = sim ]; then
+        printf '\n  *** HOMOLOGAÇÃO: os AGENDAMENTOS ficaram DESLIGADOS de propósito. ***\n'
+        if [ "$(estado_get IMPORT_PAINEL_AUTO)" = sim ]; then
+          printf '  O nome do painel NÃO é o da origem: o instalador passou --painel-hostname %s:%s (a cópia roda ao lado da produção).\n' "$(estado_get IMPORT_PAINEL)" "$HTTPS_PORT"
+        fi
+        printf '  Liberar a manutenção NÃO religa os agendamentos. Para ENCERRAR a homologação:\n'
+        printf '    cd %s && sudo -u %s venv/bin/python -m tools.pacote homologacao --encerrar\n' "$NB_DIR" "$APP_USER"
+        printf '  (só remove o marcador e a faixa e lista o que religar; não religa nada sozinho. "homologacao" sem\n'
+        printf '  --encerrar só mostra o estado.) Siga a lista e o CHECKLIST DO DESTINO abaixo.\n'
+      fi
+      if [ -s "$CHECKLIST_ARQ" ]; then
+        printf '\n  CHECKLIST DO DESTINO (impresso pela ferramenta do produto):\n'
+        sed -e 's/^[[:space:]]*/    /' -- "$CHECKLIST_ARQ"
+      else
+        printf '\n  (a ferramenta não imprimiu o CHECKLIST DO DESTINO)\n'
+      fi ;;
+    iniciada|parou)
+      printf '  Importação ..........: INTERROMPIDA (pacote %s)\n' "$arq"
+      printf '  Os serviços podem estar parados e a manutenção ligada. O estado anterior do produto está em %s/\n' "$PRE_IMPORT_DIR" ;;
+    recusada)
+      printf '  Importação ..........: NÃO feita (recusada; o produto foi restaurado ao estado anterior; pacote %s)\n' "$arq" ;;
+    *)
+      printf '  Importação ..........: não\n' ;;
+  esac
+}
+
 relatorio_texto() {
-  local hmodo ctipo acesso commit admin e feito_deploy=0
+  local hmodo ctipo acesso commit admin e feito_deploy=0 imp
+  imp="$(estado_get IMPORT_STATUS)"
   hmodo="$(estado_get HTTPS_MODO)"; ctipo="$(estado_get CERT_TIPO)"; acesso="$(estado_get ACESSO)"
   commit="$(estado_get PRODUTO_COMMIT)"; admin="$(estado_get ADMIN)"
   deploy_estado
@@ -2356,8 +3036,13 @@ relatorio_texto() {
   printf '\nACESSO\n'
   if [ "$hmodo" = provisorio ] && [ -n "$acesso" ]; then printf '  Acesse %s (aviso do navegador esperado: certificado provisório)\n' "$acesso"
   elif [ -n "$acesso" ]; then printf '  Acesse %s\n' "$acesso"; else printf '  (o HTTPS ainda não foi configurado)\n'; fi
-  printf '  Login ...............: admin\n'
-  printf '  Senha ...............: a que você digitou no deploy.sh (não é gravada em lugar nenhum)\n'
+  if [ "$imp" = feita ]; then
+    printf '  Login/senha .........: os do servidor de ORIGEM (o banco foi importado; o admin criado no deploy pode não existir mais)\n'
+  else
+    printf '  Login ...............: admin\n'
+    printf '  Senha ...............: a que você digitou no deploy.sh (não é gravada em lugar nenhum)\n'
+  fi
+  relatorio_importacao
   printf '\nO QUE FOI FEITO\n'
   printf '  - pré-checagem da VM\n'
   if disco_pronto; then printf '  - disco de dados em %s (LVM %s/%s)\n' "$OPT_DIR" "$VG_NAME" "$LV_NAME"; fi
@@ -2365,6 +3050,7 @@ relatorio_texto() {
   if [ "$feito_deploy" = 1 ]; then
     printf '  - configuração do produto (fuso, portas sugeridas, PANEL_HOSTNAME, redes) e deploy.sh concluído\n'
   fi
+  if [ "$imp" = feita ]; then printf '  - importação do pacote do sistema (%s)\n' "$(estado_get IMPORT_ARQUIVO)"; fi
   case "$hmodo" in
     definitivo) printf '  - HTTPS com certificado %s para %s\n' "$([ "$ctipo" = staging ] && echo 'de TESTE (staging)' || echo 'Let'"'"'s Encrypt')" "${R_DOMINIO:-o painel}" ;;
     provisorio) printf '  - HTTPS PROVISÓRIO (certificado autoassinado) no site do Nginx\n' ;;
@@ -2391,7 +3077,13 @@ relatorio_texto() {
     printf '    pelo NOME com certificado provisório ou de TESTE; use o acesso pelo IP (https://%s:%s) até o\n' "$(acesso_ip)" "$HTTPS_PORT"
     printf '    certificado definitivo.\n'
   fi
-  if [ "$feito_deploy" = 1 ] && [ "$admin" != criado ] && [ "$admin" != existente ]; then
+  if [ "$imp" = feita ]; then
+    printf '  - liberar a manutenção do produto (ela continua LIGADA; veja a seção IMPORTAÇÃO acima)\n'; pend=1
+    if [ "$(estado_get IMPORT_HOMOLOGACAO)" = sim ]; then printf '  - HOMOLOGAÇÃO: agendamentos desligados até você encerrar a homologação\n'; fi
+  elif [ "$imp" = iniciada ] || [ "$imp" = parou ]; then
+    printf '  - importação INTERROMPIDA: confira o estado anterior em %s/ antes de religar os serviços\n' "$PRE_IMPORT_DIR"; pend=1
+  fi
+  if [ "$feito_deploy" = 1 ] && [ "$imp" != feita ] && [ "$admin" != criado ] && [ "$admin" != existente ]; then
     printf '  - criar o administrador: cd %s && sudo -u %s venv/bin/python tools/create_admin.py\n' "$NB_DIR" "$APP_USER"; pend=1
   fi
   if [ -n "$(estado_get CONFIG_MANTIDOS)" ]; then
@@ -2399,11 +3091,19 @@ relatorio_texto() {
   fi
   if [ "$pend" = 0 ]; then printf '  (nada)\n'; fi
   printf '\nPRÓXIMOS PASSOS\n'
-  printf '  1. Abra o endereço de acesso acima e entre com o login admin.\n'
-  printf '  2. No painel, ligue os módulos opcionais conforme a necessidade: backup externo,\n'
-  printf '     Telegram, e-mail, monitor etc. (nenhum vem ligado).\n'
-  printf '  3. Cadastre os equipamentos (portas sugeridas já configuradas).\n'
-  printf '  4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá).\n'
+  if [ "$imp" = feita ]; then printf '  1. Abra o endereço de acesso acima e entre com um usuário do servidor de origem.\n'
+  else printf '  1. Abra o endereço de acesso acima e entre com o login admin.\n'; fi
+  if [ "$imp" = feita ]; then
+    printf '  2. Siga o CHECKLIST DO DESTINO (seção IMPORTAÇÃO acima).\n'
+    printf '  3. Libere a manutenção do produto (botão "Liberar agendador" ou tools.manutencao desligar).\n'
+    printf '  4. Em homologação, encerre quando for o caso: tools.pacote homologacao --encerrar (seção IMPORTAÇÃO).\n'
+    printf '  5. Confira a tela Firewall do painel ("Aplicar regras faltantes"; as redes do pacote e as das respostas podem diferir).\n'
+  else
+    printf '  2. No painel, ligue os módulos opcionais conforme a necessidade: backup externo,\n'
+    printf '     Telegram, e-mail, monitor etc. (nenhum vem ligado).\n'
+    printf '  3. Cadastre os equipamentos (portas sugeridas já configuradas).\n'
+    printf '  4. Confira a tela Firewall do painel (as regras criadas aqui aparecem lá).\n'
+  fi
 }
 
 # Gera o texto, grava $RELATORIO_TXT (600) e o mostra.
@@ -2417,7 +3117,7 @@ relatorio_grava() {
 }
 
 etapa_relatorio_run() {
-  saida "== 10. Relatório =="
+  saida "== 11. Relatório =="
   deploy_estado
   case "$DEPLOY_ESTADO" in
     pendente) deploy_check || RC_FINAL=1 ;;
@@ -2470,6 +3170,9 @@ modo_executar() {
   local e
   abre_log
   GIT_SSH_COMMAND="$(git_ssh_cmd)"; export GIT_SSH_COMMAND
+  if [ "$IMP_ATIVO" = 1 ]; then
+    registra "Importação solicitada: arquivo=$IMP_NOME homologacao=$IMP_HOMOL painel-hostname=${IMP_HOST:-(do pacote)} forcar=$IMP_FORCAR sem-sha256=$IMP_SEM_SHA"
+  fi
   for e in "${ETAPAS[@]}"; do
     "etapa_${e}_run"
   done
@@ -2484,11 +3187,24 @@ Uso: sudo bash instalar.sh [opção]
                        opcional, chave de deploy, código, configuração, deploy.sh,
                        HTTPS, firewall e relatório; pode ser repetido (retoma)
   --respostas ARQUIVO  usa um arquivo CHAVE=valor (sem segredos) em vez de perguntar
+  --importar ARQUIVO   instala já com os dados de outro servidor (recuperação ou
+                       migração): ARQUIVO é um pacote do sistema do produto
+                       (netbackup...-AAAAMMDD_HHMMSS-(sistema|completo)[-N].tar.gz[.gpg]).
+                       A senha do pacote é pedida no terminal (nunca em arquivo).
+                       Com --check, valida o arquivo e o .sha256 sem alterar nada.
+      --homologacao            importa em modo homologação (agendamentos desligados)
+      --painel-hostname N[:P]  nome do painel no destino (padrão: o do pacote)
+      --forcar-importacao      permite importar sobre um produto que JÁ TEM dados
+                               (SOBREPÕE equipamentos e backups atuais)
+      --sem-sha256             aceita o pacote sem o arquivo ARQUIVO.sha256
   --certificado        troca o HTTPS provisório pelo certificado Let's Encrypt
                        (depois que o DNS apontar para a VM)
   --check              só leitura: informa ok/falta por item, não altera nada
   --status             só leitura: resumo do que está pronto (sem rede)
   -h, --help           esta ajuda
+
+Chaves extras do --respostas: IMPORTAR_ARQUIVO, IMPORTAR_HOMOLOGACAO (sim|nao),
+IMPORTAR_PAINEL_HOSTNAME. A senha do pacote NUNCA vai no arquivo de respostas.
 
 Variável útil: LE_STAGING=1 usa o ambiente de TESTE do Let's Encrypt (bancada).
 Software proprietário, uso sob licença.
@@ -2515,6 +3231,25 @@ main() {
           printf 'ERRO: --respostas precisa de um ARQUIVO (uma vez só).\n' >&2; exit 2
         fi
         RESPOSTAS_ARQ="$2"; shift ;;
+      --importar|--painel-hostname)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          printf 'NetBackup Instalador versão %s\n' "$VERSAO"
+          printf 'ERRO: %s precisa de um valor.\n' "$1" >&2; exit 2
+        fi
+        case "$1" in
+          --importar)
+            if [ -n "$CLI_IMP_ARQ" ]; then printf 'ERRO: --importar só pode aparecer uma vez.\n' >&2; exit 2; fi
+            CLI_IMP_ARQ="$2" ;;
+          *)
+            if [ -n "$CLI_IMP_HOST" ]; then printf 'ERRO: --painel-hostname só pode aparecer uma vez.\n' >&2; exit 2; fi
+            if ! CLI_IMP_HOST="$(host_painel_valido "$2")"; then
+              printf 'ERRO: --painel-hostname inválido: use NOME ou NOME:PORTA (nome em minúsculas, com ponto, sem http://).\n' >&2; exit 2
+            fi ;;
+        esac
+        shift ;;
+      --homologacao) CLI_IMP_HOMOL=1 ;;
+      --forcar-importacao) IMP_FORCAR=1 ;;
+      --sem-sha256) IMP_SEM_SHA=1 ;;
       *) printf 'NetBackup Instalador versão %s\n' "$VERSAO"
          printf 'ERRO: opção desconhecida: %s\n' "$1" >&2; uso >&2; exit 2 ;;
     esac
@@ -2523,12 +3258,17 @@ main() {
   if [ -n "$RESPOSTAS_ARQ" ] && [ "$MODO" != "executar" ]; then
     printf 'ERRO: --respostas só vale na instalação completa.\n' >&2; exit 2
   fi
+  if { [ -n "$CLI_IMP_ARQ" ] || [ "$CLI_IMP_HOMOL" = 1 ] || [ -n "$CLI_IMP_HOST" ] || [ "$IMP_FORCAR" = 1 ] || [ "$IMP_SEM_SHA" = 1 ]; } \
+     && [ "$MODO" != "executar" ] && [ "$MODO" != "check" ]; then
+    printf 'ERRO: as opções de importação só valem na instalação completa ou com --check.\n' >&2; exit 2
+  fi
 
   printf 'NetBackup Instalador versão %s\n' "$VERSAO"
   if [ "$MODO" = "ajuda" ]; then uso; exit 0; fi
 
   exige_root
   exige_instalador_confiavel
+  importar_resolve
 
   case "$MODO" in
     check) modo_check; exit $? ;;

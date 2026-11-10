@@ -8,11 +8,14 @@ equipamentos de rede).
 
 ## Estado atual: Versão 0.2.0
 
+> Em desenvolvimento (`0.3.0-dev`, ainda sem tag): `--importar`, descrito em
+> [Importar os dados de outro servidor](#importar-os-dados-de-outro-servidor---importar).
+
 Leva a VM limpa até **"acesse https://NOME:44318"**. Ordem das etapas:
 
 ```
 precheck → perguntas → [resumo + confirmação] → disco → chave → codigo
-        → config → deploy → https → firewall → relatorio
+        → config → deploy → [importar] → https → firewall → relatorio
 ```
 
 1. **pré-checagem** (sistema, UFW, relógio, memória, espaço, saída para o GitHub);
@@ -21,17 +24,18 @@ precheck → perguntas → [resumo + confirmação] → disco → chave → codi
    chave ficam no meio;
 3. **disco de dados** opcional em `/opt` (LVM + ext4);
 4. **chave de deploy** do GitHub, somente leitura;
-5. **código** do produto (clone);
+5. **código** do produto (clone; se `/opt/netbackup` já existe, é comparado com `origin/main`: em dia segue, atrás pergunta "Atualizar para Y? [S/n]" e faz `merge --ff-only`, divergente ou com alterações locais recusa antes da configuração);
 6. **config**: cria `app_settings.conf` (com `APP_SECRET_KEY` nova, 600) e os
    arquivos de redes confiáveis a partir dos modelos do próprio produto e aplica as
    respostas (fuso, portas sugeridas, `PANEL_HOSTNAME`, redes). Guarda uma cópia do
    modelo do Nginx numa pasta só do root, com o sha256 registrado;
 7. **deploy**: executa `deploy.sh --dominio NOME` (o `deploy.sh` pede a senha do
    administrador, digitada no terminal e nunca gravada);
-8. **https**: confere o DNS, emite o certificado Let's Encrypt (ou liga o HTTPS
+8. **importar** (só com `--importar`): ver a seção própria abaixo;
+9. **https**: confere o DNS, emite o certificado Let's Encrypt (ou liga o HTTPS
    provisório), gera o site do Nginx e o liga;
-9. **firewall**: libera a `44318/tcp` para as redes do painel;
-10. **relatório**: além do resumo na tela, grava `/root/netbackup-instalacao.txt` (600).
+10. **firewall**: libera a `44318/tcp` para as redes do painel;
+11. **relatório**: além do resumo na tela, grava `/root/netbackup-instalacao.txt` (600).
 
 ## Requisitos
 
@@ -159,6 +163,68 @@ comentário** que a tela Firewall do produto usa (`NetBackup HTTPS (Nginx) - pai
 Só acrescenta: não remove nem altera regra existente, não toca nas regras do
 baseline (SSH) e é idempotente.
 
+### Importar os dados de outro servidor (`--importar`)
+
+Para instalar uma VM nova **já com os dados de outro servidor** (recuperação ou
+migração), a partir de um *pacote do sistema* exportado pelo produto:
+
+```bash
+bash instalar.sh --importar /root/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg
+```
+
+Opções: `--homologacao` (importa com os agendamentos desligados), `--painel-hostname
+NOME[:PORTA]` (nome do painel no destino; o padrão é o do pacote), `--forcar-importacao`
+(permite importar sobre um produto que **já tem dados**: sobrepõe) e `--sem-sha256`.
+Também vale com `--respostas` (chaves `IMPORTAR_ARQUIVO`, `IMPORTAR_HOMOLOGACAO=sim|nao`,
+`IMPORTAR_PAINEL_HOSTNAME`; a linha de comando vence o arquivo). **A senha do pacote
+nunca vai no arquivo de respostas**: é sempre pedida no terminal (sem eco).
+
+1. **Antes de qualquer alteração**: o arquivo existe, é arquivo comum (sem link),
+   legível e tem nome `netbackup...-AAAAMMDD_HHMMSS-(sistema|completo)[-N].tar.gz[.gpg]`.
+   Se existir `ARQUIVO.sha256` ao lado, é conferido (uma linha `HASH  NOME`). Sem ele, o
+   instalador avisa e pede `sim` (ou use `--sem-sha256`).
+2. **Instalação normal até o deploy**, com o administrador inicial.
+3. **Transporte**: o root só *lê* o pacote; o próprio `netbackup` grava a cópia em
+   `/home/netbackup/importar` (pasta 700, arquivo 600), e o sha256 da cópia é conferido.
+4. **`importar --check`** da ferramenta do produto, rodada sempre como `netbackup` a
+   partir de `/opt/netbackup`. A senha é pedida aqui (até 3 tentativas para senha errada).
+   A mesma senha é reaproveitada, só em memória, no passo real (descritor 3; nunca em
+   argv, disco, log, estado nem relatório).
+5. **Para** `netbackup.service` e `netbackup-scheduler.service`, **liga a manutenção**,
+   **importa** e **religa** os serviços. **A manutenção continua ligada** até você
+   liberar: pelo botão **"Liberar agendador"** da faixa do painel ou por
+   `cd /opt/netbackup && sudo -u netbackup venv/bin/python -m tools.manutencao desligar`
+   (`... estado`: saída 0 = desligada, 10 = ligada).
+   Em **homologação**, sem `--painel-hostname`, o instalador passa
+   `--painel-hostname <domínio das respostas>:44318` (nunca o nome da origem, pois a cópia roda ao
+   lado da produção). Para encerrar: `cd /opt/netbackup && sudo -u netbackup venv/bin/python -m tools.pacote homologacao --encerrar`.
+   As redes do painel no produto vêm do pacote, mas o UFW recebe as das respostas: confira em
+   Firewall > "Aplicar regras faltantes". A senha do administrador pedida no deploy é temporária.
+6. **HTTPS** com o nome do painel do pacote (ou de `--painel-hostname`); se ele for
+   diferente do nome das respostas, o instalador avisa, atualiza as respostas gravadas e
+   o DNS desse nome é que precisa apontar para a VM.
+7. **Relatório** (`/root/netbackup-instalacao.txt`): importação sim/não, nome do arquivo,
+   origem, homologação e o *CHECKLIST DO DESTINO* impresso pela ferramenta. Em homologação
+   destaca que os agendamentos ficaram desligados. Depois do sucesso o instalador pergunta
+   se apaga a cópia em `/home/netbackup/importar` (padrão: apagar); em falha a mantém e diz onde está.
+
+**Destino com dados**: se o produto já tiver backups, banco com usuários anteriores ao
+deploy ou tiver sido instalado fora do instalador, a importação é **recusada**; com
+`--forcar-importacao` ela sobrepõe (pede confirmação; o estado anterior fica em
+`/opt/netbackup/system_backups/pre-importacao/`).
+
+**Códigos da ferramenta**: 0 ok; 1 erro de E/S; 2 recusado; 3 pacote inválido/adulterado;
+4 senha errada; 5 pacote mais novo que o código (atualize o produto); 6 `gpg` ausente;
+7 parou no meio. No **7** os serviços **não** sobem, a manutenção fica ligada e o
+instalador mostra onde está o estado anterior; nas demais recusas antes da importação ele
+restaura a manutenção e religa os serviços. O importar real **nunca** roda sem um
+`--check` com saída 0 sobre a mesma cópia.
+
+`bash instalar.sh --check --importar ARQUIVO` valida tudo o que dá sem alterar nada
+(arquivo, nome, sha256, `gpg`, `sudo`, destino com dados) e avisa que a senha será pedida.
+O pacote não traz os `backups/` dos equipamentos nem o `rclone.conf` (a não ser que tenha
+sido exportado com `--com-rclone`): veja o checklist.
+
 ### Regras de segurança
 
 Precisa de root; recusa rodar se o arquivo ou qualquer pasta acima dele não for do
@@ -196,13 +262,18 @@ bash instalar.sh --help
 - A conferência de confiança cobre o `deploy.sh`, os ganchos do certbot e as pastas
   acima deles, não os arquivos que eles carregam.
 - Sem `dig` (pacote `bind9-dnsutils`) o DNS não é conferido e o HTTPS fica provisório.
-- Não há atualização (`git pull`) do código já instalado.
+- Não há atualização do código depois do deploy; antes dele, um clone atrasado é atualizado por fast-forward (com pergunta).
+- Importação: "destino com dados" é detectado por backups em `/opt/netbackup/backups`, banco
+  que já tinha usuários antes do deploy e produto instalado fora do instalador; equipamentos
+  cadastrados sem nenhum backup não são vistos pelo instalador. Uma importação interrompida
+  (código 7) bloqueia nova tentativa com `--importar` até você resolver à mão.
 
 ## Variáveis (para testes)
 
 Todos os caminhos e comandos podem ser sobrescritos por ambiente (`OPT_DIR`,
 `SSH_DIR`, `LOG_DIR`, `ESTADO_DIR`, `SHARE_DIR`, `LE_LIVE`, `HOOKS_DIR`, `REPO`, `BRANCH`,
-`CMD_GIT`, `CMD_DIG`, `CMD_CERTBOT`, `CMD_NGINX`, `CMD_LSBLK`, ...; veja o topo
+`CMD_GIT`, `CMD_DIG`, `CMD_CERTBOT`, `CMD_NGINX`, `CMD_LSBLK`, `CMD_SUDO`, `CMD_GPG`,
+`IMPORT_DIR`, `BACKUPS_DIR`, `PRE_IMPORT_DIR`, ...; veja o topo
 de `instalar.sh`). Os padrões são os valores reais. Exemplo de repositório
 alternativo: `REPO=git@github-netbackup:example/produto.git`.
 
