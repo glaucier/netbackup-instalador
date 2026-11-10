@@ -2,9 +2,9 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
-## [Não lançado]
+## [0.3.0] - 2026-11-10
 
-Versão em desenvolvimento: `0.3.0-dev` (PR C3).
+Importação dos dados de outro servidor na instalação (`--importar`).
 
 ### Adicionado
 
@@ -41,7 +41,9 @@ Versão em desenvolvimento: `0.3.0-dev` (PR C3).
   será pedida na instalação.
 - Nova etapa `importar` (entre `deploy` e `https`); as etapas seguintes passam a ser 9, 10 e 11.
 
-### Importação, ajustes da revisão (v2)
+### Alterado
+
+#### Ajustes da revisão (v2)
 
 - Leitura do `PANEL_HOSTNAME` do `importar --check` corrigida: vale só o primeiro token depois
   de `destino ` (a linha sem `--painel-hostname` traz um texto explicativo depois do nome, que
@@ -55,7 +57,13 @@ Versão em desenvolvimento: `0.3.0-dev` (PR C3).
 - Com `--importar`, o aviso antes da senha do administrador diz que ela é temporária (o banco será trocado).
 - shellcheck limpo (variável sem uso removida).
 
-### Importação, ajustes do teste real (v3)
+### Corrigido
+
+- Leitura do nome do painel no `importar --check` (ver v2 acima).
+- Relatório com importação: o item "encerre a homologação" só aparece quando a importação foi
+  feita com `--homologacao` (numa recuperação ele não faz sentido); os itens são renumerados.
+
+#### Ajustes do teste real (v3)
 
 - Código do produto: um clone existente agora é comparado com `origin/<branch>` (fetch). Em dia: segue.
   Atrás com fast-forward possível e sem alterações locais: mostra "local X, remoto Y", pergunta
@@ -69,13 +77,15 @@ Versão em desenvolvimento: `0.3.0-dev` (PR C3).
 - Relatório com importação: "Próximos passos" próprios (usuário da origem, CHECKLIST, liberar a
   manutenção, encerrar a homologação, conferir o Firewall). Sem importação nada muda.
 
-### Limitações conhecidas (importação)
+### Limitações conhecidas
 
 - "Destino com dados" é detectado por arquivos em `/opt/netbackup/backups`, por banco que já
   tinha usuários antes do deploy e por produto instalado fora do instalador; equipamentos
   cadastrados sem nenhum backup não são vistos pelo instalador (só pela ferramenta do produto).
 - Importação interrompida (código 7) ou sem estado conhecido bloqueia nova tentativa com
   `--importar`; resolva à mão e rode o instalador sem `--importar`.
+- A comparação do clone com `origin/main` (v3) foi testada só com `git` simulado; o teste real
+  fica para a próxima instalação a partir de VM limpa.
 
 ## [0.2.0] - 2026-11-07
 

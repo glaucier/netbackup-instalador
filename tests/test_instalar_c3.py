@@ -1043,10 +1043,19 @@ class TestResumoERelatorio(BaseImp):
         prox = rel[rel.index("PRÓXIMOS PASSOS"):]
         for txt in ("1. Abra o endereço de acesso acima e entre com um usuário do servidor de origem",
                     "2. Siga o CHECKLIST DO DESTINO", "3. Libere a manutenção do produto",
-                    "4. Em homologação, encerre quando for o caso", "5. Confira a tela Firewall", "Aplicar regras faltantes"):
+                    "4. Confira a tela Firewall", "Aplicar regras faltantes"):
             self.assertIn(txt, prox)
+        self.assertNotIn("homologação", prox.lower().replace("seção importação", ""))
+        self.assertNotIn("5. ", prox)
         self.assertNotIn("Cadastre os equipamentos", prox)
         self.assertNotIn("nenhum vem ligado", prox)
+
+    def test_proximos_passos_homologacao(self):
+        p, out = self.imp("--homologacao")
+        rel = self.report.read_text()
+        prox = rel[rel.index("PRÓXIMOS PASSOS"):]
+        self.assertIn("4. Encerre a homologação quando for o caso", prox)
+        self.assertIn("5. Confira a tela Firewall", prox)
 
     def test_proximos_passos_sem_importacao_nao_mudam(self):
         p, out = self.run_full()
