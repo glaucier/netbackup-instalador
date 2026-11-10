@@ -446,10 +446,10 @@ class TestSegurancaDoInstalador(Base):
     def test_versao_impressa_sempre(self):
         p, out = self.run_inst("--help")
         self.assertEqual(p.returncode, 0)
-        self.assertIn("versão 0.3.0-dev", out)
+        self.assertIn("versão 0.3.0", out)
         self.extra_env["FAKE_UID"] = "1000"
         p, out = self.run_inst()
-        self.assertIn("versão 0.3.0-dev", out)
+        self.assertIn("versão 0.3.0", out)
 
     def test_opcao_desconhecida(self):
         p, out = self.run_inst("--xyz")
@@ -1220,7 +1220,7 @@ class TestLog(Base):
         self.assertRegex(logs[0].name, r"^netbackup-instalacao-\d{8}_\d{6}\.log$")
         self.assertEqual(stat.S_IMODE(logs[0].stat().st_mode), 0o600)
         txt = logs[0].read_text()
-        self.assertIn("versão 0.3.0-dev", txt)
+        self.assertIn("versão 0.3.0", txt)
         self.assertIn("PERGUNTA:", txt)
         self.assertIn("== 1. Pré-checagem ==", txt)
         self.assertNotIn("FAKE-PRIVATE-KEY", txt)

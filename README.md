@@ -6,10 +6,10 @@ equipamentos de rede).
 > **Software proprietário, uso sob licença.** Este repositório contém apenas o
 > instalador; o produto em si está em repositório privado e exige licença.
 
-## Estado atual: Versão 0.2.0
+## Estado atual: Versão 0.3.0
 
-> Em desenvolvimento (`0.3.0-dev`, ainda sem tag): `--importar`, descrito em
-> [Importar os dados de outro servidor](#importar-os-dados-de-outro-servidor---importar).
+> Novidade da 0.3.0: `--importar`, descrito em
+> [Instalar já com os dados de outro servidor](#instalar-já-com-os-dados-de-outro-servidor---importar).
 
 Leva a VM limpa até **"acesse https://NOME:44318"**. Ordem das etapas:
 
@@ -63,7 +63,7 @@ cd /root/instalador
 ```
 
 ```bash
-TAG=v0.2.0
+TAG=v0.3.0
 BASE=https://raw.githubusercontent.com/glaucier/netbackup-instalador/$TAG
 curl -fsSLO "$BASE/instalar.sh"
 curl -fsSLO "$BASE/SHA256SUMS"
@@ -163,13 +163,26 @@ comentário** que a tela Firewall do produto usa (`NetBackup HTTPS (Nginx) - pai
 Só acrescenta: não remove nem altera regra existente, não toca nas regras do
 baseline (SSH) e é idempotente.
 
-### Importar os dados de outro servidor (`--importar`)
+### Instalar já com os dados de outro servidor (`--importar`)
 
 Para instalar uma VM nova **já com os dados de outro servidor** (recuperação ou
 migração), a partir de um *pacote do sistema* exportado pelo produto:
 
 ```bash
 bash instalar.sh --importar /root/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg
+```
+
+Exemplo completo (pacote exportado no servidor de origem, copiado para a VM nova):
+
+```bash
+# na VM nova: copie o pacote e o .sha256 que ficam ao lado dele
+scp origem:/caminho/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg{,.sha256} /root/
+# valida tudo o que dá sem alterar nada (a senha só é pedida na instalação)
+bash instalar.sh --check --importar /root/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg
+# recuperação/migração
+bash instalar.sh --importar /root/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg
+# ou cópia de homologação (agendamentos desligados; não assume o nome da origem)
+bash instalar.sh --importar /root/netbackup-AAAAMMDD_HHMMSS-sistema.tar.gz.gpg --homologacao
 ```
 
 Opções: `--homologacao` (importa com os agendamentos desligados), `--painel-hostname

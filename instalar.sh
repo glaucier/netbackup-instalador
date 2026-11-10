@@ -26,7 +26,7 @@
 set -u
 export LC_ALL=C
 
-VERSAO="0.3.0-dev"
+VERSAO="0.3.0"
 
 # ---- Configuração (tudo sobrescrevível por ambiente; padrões = valores reais) --
 REPO="${REPO:-git@github-netbackup:glaucier/netbackup-manager.git}"
@@ -3096,8 +3096,11 @@ relatorio_texto() {
   if [ "$imp" = feita ]; then
     printf '  2. Siga o CHECKLIST DO DESTINO (seção IMPORTAÇÃO acima).\n'
     printf '  3. Libere a manutenção do produto (botão "Liberar agendador" ou tools.manutencao desligar).\n'
-    printf '  4. Em homologação, encerre quando for o caso: tools.pacote homologacao --encerrar (seção IMPORTAÇÃO).\n'
-    printf '  5. Confira a tela Firewall do painel ("Aplicar regras faltantes"; as redes do pacote e as das respostas podem diferir).\n'
+    n=4
+    if [ "$(estado_get IMPORT_HOMOLOGACAO)" = sim ]; then
+      printf '  %s. Encerre a homologação quando for o caso: tools.pacote homologacao --encerrar (seção IMPORTAÇÃO).\n' "$n"; n=$((n + 1))
+    fi
+    printf '  %s. Confira a tela Firewall do painel ("Aplicar regras faltantes"; as redes do pacote e as das respostas podem diferir).\n' "$n"
   else
     printf '  2. No painel, ligue os módulos opcionais conforme a necessidade: backup externo,\n'
     printf '     Telegram, e-mail, monitor etc. (nenhum vem ligado).\n'
